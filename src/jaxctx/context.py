@@ -1,0 +1,476 @@
+import dataclasses
+import warnings
+from collections import defaultdict
+from contextlib import contextmanager
+from functools import wraps
+from typing import Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax._src.typing import SupportsDType
+
+__all__ = [
+    'get_parameter',
+    'set_parameter',
+    'transform',
+    'convert_external_params',
+    'wrap_random',
+    'next_rng_key',
+    'scope'
+]
+
+
+class ScopedDict:
+    """
+    prefixes all keys with a given scope {scope}.{key}
+    """
+
+    def __init__(self, _dict=None, _scopes=None):
+        self._scopes: List[str] = _scopes or []
+        self._dict = _dict or dict()
+
+    def with_scopes(self, scopes: List[str]) -> 'ScopedDict':
+        self._scopes = scopes
+        return self
+
+    @property
+    def scope_prefix(self):
+        return '.'.join(self._scopes)
+
+    def to_dict(self):
+        return self._dict
+
+    def __repr__(self):
+        return f"ScopedDict(scopes={repr(self._scopes)}, dict={repr(self._dict)})"
+
+    def __getitem__(self, item):
+        return self._dict[f"{self.scope_prefix}.{item}"]
+
+    def __setitem__(self, key, value):
+        self._dict[f"{self.scope_prefix}.{key}"] = value
+
+    def __contains__(self, item):
+        return f"{self.scope_prefix}.{item}" in self._dict
+
+    def __iter__(self):
+        return iter(self._dict)
+
+    def __len__(self):
+        return len(self._dict)
+
+    def keys(self):
+        return self._dict.keys()
+
+    def values(self):
+        return self._dict.values()
+
+    def items(self):
+        return self._dict.items()
+
+
+# Add as pytree type
+
+def scoped_dict_flatten(scoped_dict: ScopedDict):
+    return (
+        [
+            scoped_dict._dict
+        ],
+        (scoped_dict._scopes,)
+    )
+
+
+def scoped_dict_unflatten(aux_data, children):
+    [_dict] = children
+    (_scopes,) = aux_data
+    return ScopedDict(_dict=_dict, _scopes=_scopes)
+
+
+jax.tree_util.register_pytree_node(
+    ScopedDict,
+    scoped_dict_flatten,
+    scoped_dict_unflatten
+)
+
+PRNGKey = jax.Array
+
+
+class Ctx:
+    def __init__(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict], stack: List['Ctx'], init: bool):
+        self._collections = defaultdict(ScopedDict)
+        for key, val in collections.items():
+            self._collections[key] = val
+        self._rngs = rngs
+        self._stack = stack
+        self._scopes = []
+        self._init = init
+
+    def next_rng_key(self, rng_stream: str) -> PRNGKey:
+        if rng_stream not in self._rngs:
+            raise ValueError(f"RNG stream {rng_stream} not provided.")
+        self._rngs[rng_stream], new_rng = jax.random.split(self._rngs[rng_stream])
+        return new_rng
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stack.remove(self)
+        return
+
+    @property
+    def is_init(self) -> bool:
+        return self._init
+
+    @property
+    def collections(self) -> Dict[str, ScopedDict]:
+        return dict(self._collections.items())
+
+    def get_collection(self, collection: str) -> ScopedDict:
+        return self._collections[collection].with_scopes(self._scopes)
+
+    def push_scope(self, scope):
+        self._scopes.append(scope)
+
+    def pop_scope(self):
+        self._scopes.pop()
+
+
+class GlobalContext:
+    def __init__(self, rng: Optional[jax.Array] = None):
+        self.stack: List[Ctx] = []
+
+    def new(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict], init: bool):
+        new_ctx = Ctx(rngs=rngs, collections=collections, stack=self.stack, init=init)
+        self.stack.append(new_ctx)
+        return new_ctx
+
+    @property
+    def collections(self) -> Dict[str, ScopedDict]:
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use `transform` to create a context.")
+        return self.stack[-1].collections
+
+    @property
+    def is_init(self) -> bool:
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use `transform` to create a context.")
+        return self.stack[-1].is_init
+
+
+    def get_collection(self, collection: str) -> ScopedDict:
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use `transform` to create a context.")
+        return self.stack[-1].get_collection(collection)
+
+    def next_rng_key(self, rng_stream: str) -> PRNGKey:
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use transform_with_state to create a context.")
+        return self.stack[-1].next_rng_key(rng_stream)
+
+    def push_scope(self, scope: str):
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use transform_with_state to create a context.")
+        self.stack[-1].push_scope(scope)
+
+    def pop_scope(self):
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use transform_with_state to create a context.")
+        self.stack[-1].pop_scope()
+
+
+global_context = GlobalContext()
+
+PT = TypeVar('PT')
+InitType = Callable[[Tuple[int, ...], SupportsDType], PT] | Callable[[], PT]
+
+
+@contextmanager
+def scope(name: str):
+    """
+    Create a new scope, to prefix parameters and states, as {current_scope}.{name}.{param_name}.
+
+    Args:
+        name: the name of the scope
+
+    Returns:
+        The scope
+    """
+    # Context manager
+    global_context.push_scope(name)
+    try:
+        yield
+    finally:
+        global_context.pop_scope()
+
+
+def default_init(shape: Tuple[int, ...], dtype: SupportsDType):
+    raise NotImplementedError("No init provided.")
+
+
+def get_parameter(name: str, collection: str, shape: Optional[Tuple[int, ...]] = None,
+                  dtype: Optional[SupportsDType] = None, *,
+                  init: InitType = default_init) -> PT:
+    """
+    Get a parameter variable.
+
+    Args:
+        name: the name of the parameter
+        collection: the collection to store parameter under.
+        shape: the shape of the parameter must be provided if init is not a jax.Array
+        dtype: the dtype of the parameter must be provided if init is not a jax.Array
+        init: the initializer
+
+    Returns:
+        The parameter variable as a jax.Array=
+    """
+    params = global_context.get_collection(collection)
+    if name not in params:
+        if callable(init):
+            if (shape is None) and (dtype is None):
+                new_param = init()
+            else:
+                new_param = init(shape, dtype)
+        else:
+            warnings.warn(
+                "Using a constant initializer for state. This is not recommended as it may induce closure issues.")
+            new_param = init
+        params[name] = new_param
+
+    return params[name]
+
+
+def set_parameter(name: str, collection: str, value: PT) -> PT:
+    """
+    Set a state variable.
+
+    Args:
+        name: the name of the state
+        collection: the collection of the parameter
+        value: the value to set
+
+    Returns:
+        The state variable as a jax.Array
+    """
+    params = global_context.get_collection(collection)
+    if name not in params:
+        raise ValueError(f"Parameter {name} not found. It must be initialised before it can be set.")
+    # Ensure same pytree def
+    tree_def = jax.tree.structure(params[name])
+    value_tree_def = jax.tree.structure(value)
+    if tree_def != value_tree_def:
+        raise ValueError(f"Expected state with tree_def {tree_def} got {value_tree_def}.")
+    if global_context.is_init:
+        return params[name]
+    params[name] = value
+    return value
+
+
+ExtParam = TypeVar('ExtParam')
+
+
+def convert_external_params(external_params: ExtParam, collection: str, prefix: str = "") -> ExtParam:
+    """
+    Convert external parameters to context parameters. This can be used to convert haiku or flax parameters to
+    jaxctx parameters.
+
+    Args:
+        external_params: map of name -> value
+        collection: which collection to store the parameters in
+        prefix: an optional prefix for the param name to make it unique.
+
+    Returns:
+        The context parameters
+    """
+    leaf_list, tree_def = jax.tree.flatten(external_params)
+
+    def _unique_name(idx):
+        return f"__{prefix}_{idx}"
+
+    ctx_params = [get_parameter(_unique_name(idx), collection, init=leaf) for idx, leaf in enumerate(leaf_list)]
+    external_params_ctx = jax.tree_unflatten(tree_def, ctx_params)
+    return external_params_ctx
+
+
+def wrap_random(f, rng_stream: str, **kwargs):
+    """
+    Wrap a function to use a random number generator from the context.
+
+    Args:
+        f: the function to wrap
+        rng_stream: the rng stream to get from
+        **kwargs options to pass to random generator.
+
+    Returns:
+        The wrapped function
+    """
+
+    @wraps(f)
+    def wrapped(shape: Tuple[int, ...], dtype: SupportsDType):
+        rng = next_rng_key(rng_stream)
+        return f(rng, shape, dtype, **kwargs)
+
+    return wrapped
+
+
+FV = TypeVar('FV')
+
+
+class ApplyReturn(NamedTuple, Generic[FV]):
+    fn_val: FV
+    collections: Dict[str, ScopedDict]
+
+
+class InitReturn(NamedTuple, Generic[FV]):
+    collections: Dict[str, ScopedDict]
+
+
+class MemoizedFn(NamedTuple, Generic[FV]):
+    apply: Callable[[...], ApplyReturn[FV]]
+    init: Callable[[...], InitReturn[FV]]
+
+
+@dataclasses.dataclass
+class TransformedFn(Generic[FV]):
+    memoize_fn: Callable
+
+    def memoize(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict]) -> \
+            MemoizedFn[FV]:
+        """
+        Memoize the function with given rngs and collections.
+
+        Args:
+            rngs: a map of stream name to rng, e.g. {'params', jax.random.PRNGKey(0)}
+            collections: a map of collection name to ScopedDict, e.g. {'params': ScopedDict()}
+
+        Returns:
+            The memoized function
+        """
+        return self.memoize_fn(rngs, collections)
+
+
+def transform(f: Callable[[...], FV]) -> TransformedFn[FV]:
+    """
+    Transform a function to use parameters and states.
+
+    Args:
+        f: the function to transform
+
+    Returns:
+        A tuple of the init and apply functions
+    """
+
+    def memoize_fn(rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict]) -> MemoizedFn[FV]:
+        """
+        Memoize the function with given rngs and collections
+
+        Args:
+            rngs: the map of random number generators
+            collections: the collections
+
+        Returns:
+            The memoized function
+        """
+
+        for collection, params in collections.items():
+            if not isinstance(params, ScopedDict):
+                collections[collection] = ScopedDict(_dict=params, _scopes=[])
+
+        @wraps(f)
+        def apply(*args, **kwargs) -> ApplyReturn[FV]:
+            """
+            Apply the function with given parameters and states.
+
+            Args:
+                *args: args to function
+                **kwargs: kwargs to function
+
+            Returns:
+                The output of the function at the given input and the states
+            """
+            with global_context.new(rngs=rngs, collections=collections, init=False) as ctx:
+                fn_val = f(*args, **kwargs)
+                return ApplyReturn(fn_val=fn_val, collections=global_context.collections)
+
+        @wraps(f)
+        def init(*args, **kwargs) -> InitReturn[FV]:
+            """
+            Apply the function with given parameters and states.
+
+            Args:
+                *args: args to function
+                **kwargs: kwargs to function
+
+            Returns:
+                The output of the function at the given input and the states
+            """
+            with global_context.new(rngs=rngs, collections=collections, init=True) as ctx:
+                _ = f(*args, **kwargs)
+                del _ # Ensure no closure issues
+                return InitReturn(collections=global_context.collections)
+
+        return MemoizedFn(apply=apply, init=init)
+
+    return TransformedFn(memoize_fn=memoize_fn)
+
+
+def next_rng_key(rng_stream: str):
+    """
+    Get the next random number generator
+
+    Returns:
+        The next random number generator
+    """
+    return global_context.next_rng_key(rng_stream)
+
+
+def test_transform():
+    def f(x) -> jax.Array:
+        y = get_parameter(
+            'y', 'params', (), jnp.float32,
+            init=wrap_random(jax.random.normal, 'params')
+        )
+        s = get_parameter('s', 'state', y.shape, y.dtype, init=jnp.zeros)
+        s = set_parameter('s', 'state', s + x + y)
+        return (x + y) / s
+
+    transformed = transform(f)
+    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, {})
+
+    init = jax.jit(mem_fn.init)(1)
+    print(init)
+
+    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, init.collections)
+
+    response = mem_fn.apply(1)
+    print(response)
+    assert response.fn_val == 1
+    for key, val in response.collections.items():
+        assert isinstance(val, ScopedDict)
+
+
+def test_transform_scan():
+    def mlp(x) -> jax.Array:
+        W = get_parameter('W', 'params', (10, np.shape(x)[-1]), jnp.float32, init=wrap_random(jax.random.normal, 'params'))
+        b = get_parameter('b', 'params', (10,), jnp.float32, init=jnp.zeros)
+        return jnp.dot(W, x) + b
+
+    def f(x):
+        # recurrent application on input
+        def body(carry, _x):
+            out = mlp(carry) + carry
+            print(out)
+            return out, ()
+        return jax.lax.scan(body, x, jnp.zeros(10))
+
+    transformed = transform(f)
+    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, {})
+
+    init = mem_fn.init(jnp.zeros(10))
+    print(init)
+
+    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, init.collections)
+
+    response = mem_fn.apply(jnp.zeros(10))
+
+    print(response)
+

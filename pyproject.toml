@@ -1,0 +1,25 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaxctx"
+version = "1.0.0"
+description = "JAX context for collectoins of parameters and RNG sequences"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache Software License" }
+authors = [{ name = "Joshua G. Albert", email = "albert@strw.leidenuniv.nl" }]
+keywords = ["jax"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent"
+]
+urls = { "Homepage" = "https://github.com/joshuaalbert/jaxctx"}
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
