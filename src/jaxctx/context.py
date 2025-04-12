@@ -4,9 +4,8 @@ from collections import defaultdict
 from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic
-import numpy as np
+
 import jax
-import jax.numpy as jnp
 from jax._src.typing import SupportsDType
 
 __all__ = [
@@ -156,7 +155,6 @@ class GlobalContext:
             raise ValueError("No context available. Must use `transform` to create a context.")
         return self.stack[-1].is_init
 
-
     def get_collection(self, collection: str) -> ScopedDict:
         if len(self.stack) == 0:
             raise ValueError("No context available. Must use `transform` to create a context.")
@@ -211,7 +209,7 @@ def get_parameter(name: str, collection: str, shape: Optional[Tuple[int, ...]] =
                   dtype: Optional[SupportsDType] = None, *,
                   init: InitType = default_init) -> PT:
     """
-    Get a parameter variable.
+    Get a parameter variable, initialised to a particular value. The parameter is stored in the given collection.
 
     Args:
         name: the name of the parameter
@@ -241,7 +239,8 @@ def get_parameter(name: str, collection: str, shape: Optional[Tuple[int, ...]] =
 
 def set_parameter(name: str, collection: str, value: PT) -> PT:
     """
-    Set a state variable.
+    Set a variable in a collection to a particular value.
+    If the name is not found in the collection then an error is raised.
 
     Args:
         name: the name of the state
@@ -294,9 +293,10 @@ def convert_external_params(external_params: ExtParam, collection: str, prefix: 
 def wrap_random(f, rng_stream: str, **kwargs):
     """
     Wrap a function to use a random number generator from the context.
+    Converts a function of (key, shape, dtype, **kwargs) into (shape, dtype).
 
     Args:
-        f: the function to wrap
+        f: the function to wrap, the args should be (key, shape, dtype, **kwargs)
         rng_stream: the rng stream to get from
         **kwargs options to pass to random generator.
 
@@ -324,33 +324,45 @@ class InitReturn(NamedTuple, Generic[FV]):
     collections: Dict[str, ScopedDict]
 
 
-class MemoizedFn(NamedTuple, Generic[FV]):
-    apply: Callable[[...], ApplyReturn[FV]]
-    init: Callable[[...], InitReturn[FV]]
-
-
 @dataclasses.dataclass
 class TransformedFn(Generic[FV]):
-    memoize_fn: Callable
+    _apply_fn: Callable
+    _init_fn: Callable
 
-    def memoize(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict]) -> \
-            MemoizedFn[FV]:
+    def apply(self, rngs, collections, *args, **kwargs) -> ApplyReturn[FV]:
         """
-        Memoize the function with given rngs and collections.
+        Apply the function with given parameters and states.
 
         Args:
             rngs: a map of stream name to rng, e.g. {'params', jax.random.PRNGKey(0)}
             collections: a map of collection name to ScopedDict, e.g. {'params': ScopedDict()}
+            *args: args to function
+            **kwargs: kwargs to function
 
         Returns:
-            The memoized function
+            The output of the function at the given input and the states
         """
-        return self.memoize_fn(rngs, collections)
+        return self._apply_fn(rngs, collections, *args, **kwargs)
+
+    def init(self, rngs, collections, *args, **kwargs) -> InitReturn[FV]:
+        """
+        Initialise the transform.
+
+        Args:
+            rngs: a map of stream name to rng, e.g. {'params', jax.random.PRNGKey(0)}
+            collections: a map of collection name to ScopedDict, e.g. {'params': ScopedDict()}
+            *args: args to function
+            **kwargs: kwargs to function
+
+        Returns:
+            The output of the function at the given input and the states
+        """
+        return self._init_fn(rngs, collections, *args, **kwargs)
 
 
-def transform(f: Callable[[...], FV]) -> TransformedFn[FV]:
+def transform(f: Callable[..., FV]) -> TransformedFn[FV]:
     """
-    Transform a function to use parameters and states.
+    Transform a function that uses parameters and states into a pure function.
 
     Args:
         f: the function to transform
@@ -359,58 +371,40 @@ def transform(f: Callable[[...], FV]) -> TransformedFn[FV]:
         A tuple of the init and apply functions
     """
 
-    def memoize_fn(rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict]) -> MemoizedFn[FV]:
+    def apply_fn(rngs, collections, *args, **kwargs) -> ApplyReturn[FV]:
         """
-        Memoize the function with given rngs and collections
+        Apply the function with given parameters and states.
 
         Args:
-            rngs: the map of random number generators
-            collections: the collections
+            *args: args to function
+            **kwargs: kwargs to function
 
         Returns:
-            The memoized function
+            The output of the function at the given input and the states
         """
 
-        for collection, params in collections.items():
-            if not isinstance(params, ScopedDict):
-                collections[collection] = ScopedDict(_dict=params, _scopes=[])
+        with global_context.new(rngs=rngs, collections=collections, init=False) as ctx:
+            fn_val = f(*args, **kwargs)
+            return ApplyReturn(fn_val=fn_val, collections=global_context.collections)
 
-        @wraps(f)
-        def apply(*args, **kwargs) -> ApplyReturn[FV]:
-            """
-            Apply the function with given parameters and states.
+    def init_fn(rngs, collections, *args, **kwargs) -> InitReturn[FV]:
+        """
+        Initialise the transform.
 
-            Args:
-                *args: args to function
-                **kwargs: kwargs to function
+        Args:
+            *args: args to function
+            **kwargs: kwargs to function
 
-            Returns:
-                The output of the function at the given input and the states
-            """
-            with global_context.new(rngs=rngs, collections=collections, init=False) as ctx:
-                fn_val = f(*args, **kwargs)
-                return ApplyReturn(fn_val=fn_val, collections=global_context.collections)
+        Returns:
+            The output of the function at the given input and the states
+        """
+        with global_context.new(rngs=rngs, collections=collections, init=True) as ctx:
+            # can be sped up with aeval
+            _ = f(*args, **kwargs)
+            del _  # Ensure no closure issues
+            return InitReturn(collections=global_context.collections)
 
-        @wraps(f)
-        def init(*args, **kwargs) -> InitReturn[FV]:
-            """
-            Apply the function with given parameters and states.
-
-            Args:
-                *args: args to function
-                **kwargs: kwargs to function
-
-            Returns:
-                The output of the function at the given input and the states
-            """
-            with global_context.new(rngs=rngs, collections=collections, init=True) as ctx:
-                _ = f(*args, **kwargs)
-                del _ # Ensure no closure issues
-                return InitReturn(collections=global_context.collections)
-
-        return MemoizedFn(apply=apply, init=init)
-
-    return TransformedFn(memoize_fn=memoize_fn)
+    return TransformedFn(_init_fn=init_fn, _apply_fn=apply_fn)
 
 
 def next_rng_key(rng_stream: str):
@@ -421,56 +415,3 @@ def next_rng_key(rng_stream: str):
         The next random number generator
     """
     return global_context.next_rng_key(rng_stream)
-
-
-def test_transform():
-    def f(x) -> jax.Array:
-        y = get_parameter(
-            'y', 'params', (), jnp.float32,
-            init=wrap_random(jax.random.normal, 'params')
-        )
-        s = get_parameter('s', 'state', y.shape, y.dtype, init=jnp.zeros)
-        s = set_parameter('s', 'state', s + x + y)
-        return (x + y) / s
-
-    transformed = transform(f)
-    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, {})
-
-    init = jax.jit(mem_fn.init)(1)
-    print(init)
-
-    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, init.collections)
-
-    response = mem_fn.apply(1)
-    print(response)
-    assert response.fn_val == 1
-    for key, val in response.collections.items():
-        assert isinstance(val, ScopedDict)
-
-
-def test_transform_scan():
-    def mlp(x) -> jax.Array:
-        W = get_parameter('W', 'params', (10, np.shape(x)[-1]), jnp.float32, init=wrap_random(jax.random.normal, 'params'))
-        b = get_parameter('b', 'params', (10,), jnp.float32, init=jnp.zeros)
-        return jnp.dot(W, x) + b
-
-    def f(x):
-        # recurrent application on input
-        def body(carry, _x):
-            out = mlp(carry) + carry
-            print(out)
-            return out, ()
-        return jax.lax.scan(body, x, jnp.zeros(10))
-
-    transformed = transform(f)
-    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, {})
-
-    init = mem_fn.init(jnp.zeros(10))
-    print(init)
-
-    mem_fn = transformed.memoize({'params': jax.random.PRNGKey(0)}, init.collections)
-
-    response = mem_fn.apply(jnp.zeros(10))
-
-    print(response)
-
