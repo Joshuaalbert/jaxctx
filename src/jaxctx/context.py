@@ -6,7 +6,6 @@ from functools import wraps
 from typing import Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic
 
 import jax
-from jax._src.typing import SupportsDType
 
 __all__ = [
     'get_parameter',
@@ -18,6 +17,10 @@ __all__ = [
     'scope',
     'CtxParams'
 ]
+
+from jax._src.typing import SupportsDType
+
+from jaxctx.priors.types import PRNGKey
 
 
 class ScopedDict:
@@ -92,8 +95,6 @@ jax.tree_util.register_pytree_node(
 )
 
 CtxParams = ScopedDict
-
-PRNGKey = jax.Array
 
 
 class Ctx:
@@ -385,6 +386,8 @@ def transform(f: Callable[..., FV]) -> TransformedFn[FV]:
         Returns:
             The output of the function at the given input and the states
         """
+        if collections is None:
+            collections = {}
 
         with global_context.new(rngs=rngs, collections=collections, init=False) as ctx:
             fn_val = f(*args, **kwargs)
@@ -401,6 +404,9 @@ def transform(f: Callable[..., FV]) -> TransformedFn[FV]:
         Returns:
             The output of the function at the given input and the states
         """
+        if collections is None:
+            collections = {}
+
         with global_context.new(rngs=rngs, collections=collections, init=True) as ctx:
             # can be sped up with aeval
             _ = f(*args, **kwargs)
