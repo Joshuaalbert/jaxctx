@@ -7,18 +7,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jaxctx"
 version = "1.0.0"
-description = "JAX context for collectoins of parameters and RNG sequences"
+description = "Lightwieght JAX context for managing collections of parameters and RNG sequences."
 readme = "README.md"
-requires-python = ">=3.11"
-license = { text = "Apache Software License" }
+license = { text = "GPL-3.0 license" }
+requires-python = ">=3.10"
 authors = [{ name = "Joshua G. Albert", email = "albert@strw.leidenuniv.nl" }]
 keywords = ["jax"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GPL-3.0 license",
     "Operating System :: OS Independent"
 ]
-urls = { "Homepage" = "https://github.com/joshuaalbert/jaxctx"}
+urls = { "Homepage" = "https://github.com/joshuaalbert/jaxctx" }
 
 
 [tool.setuptools.packages.find]
