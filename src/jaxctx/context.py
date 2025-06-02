@@ -15,7 +15,8 @@ __all__ = [
     'convert_external_params',
     'wrap_random',
     'next_rng_key',
-    'scope'
+    'scope',
+    'CtxParams'
 ]
 
 
@@ -89,6 +90,8 @@ jax.tree_util.register_pytree_node(
     scoped_dict_flatten,
     scoped_dict_unflatten
 )
+
+CtxParams = ScopedDict
 
 PRNGKey = jax.Array
 
