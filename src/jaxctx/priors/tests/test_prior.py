@@ -152,3 +152,18 @@ def test_priors():
     assert d.forward(jnp.zeros(d.base_shape, jnp.float32)).shape == d.shape
     assert d.base_shape == (5,)
     assert d.shape == (5,)
+
+def test_various_collections():
+    # We want to be able to create a model with
+    def model():
+        x = Prior(tfpd.Normal(loc=0., scale=1.), name='x').parameter()
+        y = Prior(tfpd.Uniform(low=0., high=1.), name='y').realise()
+        return x, y
+
+    transformed_model = transform(model)
+    params = transformed_model.init({'params': jax.random.PRNGKey(0), 'U': jax.random.PRNGKey(1)}, None).collections
+    print(params)
+
+    response = transformed_model.apply({'params': jax.random.PRNGKey(2), 'U': jax.random.PRNGKey(3)}, params)
+    print(response)
+

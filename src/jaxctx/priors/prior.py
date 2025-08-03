@@ -175,7 +175,7 @@ class AbstractPrior(ABC):
     def parameter(self, random_init=False, param_collection: str = 'params', rng_stream: str = 'params'):
         """
         Convert a prior into a constrained parameter, that takes a single value in the model, but still has an associated
-        log_prob. The parameter is registered into with added `_param` name suffix.
+        log_prob. The parameter is registered into the corresponding collection and stream.
 
         Args:
             random_init: Whether to initialise the parameter randomly or at the median of the distribution.
@@ -188,30 +188,19 @@ class AbstractPrior(ABC):
         return prior_to_parameter(prior=self, random_init=random_init, param_collection=param_collection,
                                   rng_stream=rng_stream)
 
-    def sample(self, rng_stream: str = 'params'):
-        """
-        Sample from the prior distribution.
-
-        Args:
-            rng_stream: The name of the random number generator stream to use for sampling.
-
-        Returns:
-            A sample from the prior distribution.
-        """
-        return sample_prior(prior=self, rng_stream=rng_stream)
-
-    def realise(self, param_collection: str = 'params', rng_stream: str = 'params'):
+    def realise(self, U_collection: str = 'U', X_collection: str = 'X', rng_stream: str = 'U'):
         """
         Realise the prior distribution into a parameter.
 
         Args:
-            param_collection: The collection to register the parameter in.
-            rng_stream: The name of the random number generator stream to use for sampling.
+            U_collection: The collection to register the parameter in.
+            X_collection: The collection to register the parameter in.
+            rng_stream: The name of the random number generator stream to use for sampling U.
 
         Returns:
             A parameter representing the prior.
         """
-        return realise_prior(prior=self, param_collection=param_collection, rng_stream=rng_stream)
+        return realise_prior(prior=self, U_collection=U_collection, X_collection=X_collection, rng_stream=rng_stream)
 
 
 class Prior(AbstractPrior):
@@ -353,7 +342,28 @@ def quick_unit_inverse(y: jax.Array) -> jax.Array:
     )
 
 
-def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection: str, rng_stream: str):
+def sample_quick_unit(key, shape, dtype):
+    """
+    Sample from the quick unit distribution.
+
+    Args:
+        key: PRNGKey to use.
+        shape: Shape of the output.
+        dtype: Dtype of the output.
+
+    Returns:
+        A jax.Array sampled from the quick unit distribution.
+    """
+
+    def normal_cdf(x):
+        # CDF of normal distribution using scipy's erf function
+        return 0.5 * (1 + jax.scipy.special.erf(x / jnp.sqrt(2)))
+
+    return quick_unit_inverse(normal_cdf(jax.random.normal(key, shape, dtype)))
+
+
+def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection: str = 'params',
+                       X_collection: str = 'X', log_prob_collection: str = 'log_prob', rng_stream: str = 'params'):
     """
     Convert a prior into a non-Bayesian parameter, that takes a single value in the model, but still has an associated
     log_prob. The parameter is registered as a `jaxns.get_parameter` with added `_param` name suffix.
@@ -372,16 +382,16 @@ def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection
     """
     if prior.name is None:
         raise ValueError("Prior must have a name to be parametrised.")
-    name = f"{prior.name}_N"
     # Initialises at median of distribution using zeros, else unit-normal.
+
     if random_init:
-        initaliser = wrap_random(jax.random.normal, rng_stream)
+        initaliser = wrap_random(sample_quick_unit, rng_stream)
     else:
         initaliser = jnp.zeros
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
     norm_U_base_param = get_parameter(
-        name=name,
+        name=prior.name,
         shape=prior.base_shape,
         dtype=prior.base_dtype,
         init=initaliser,
@@ -389,10 +399,22 @@ def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection
     )
     # transform [-inf, inf] -> [0,1]
     U_base_param = quick_unit(norm_U_base_param)
-    return prior.forward(U_base_param)
+    X_param = get_parameter(
+        name=prior.name,
+        collection=X_collection,
+        init=prior.forward(U_base_param)
+    )
+    # Register the log_prob as a parameter
+    _ = get_parameter(
+        name=prior.name,
+        collection=log_prob_collection,
+        init=prior.log_prob(X_param)
+    )
+    return X_param
 
 
-def realise_prior(prior: AbstractPrior, param_collection: str, rng_stream: str):
+def realise_prior(prior: AbstractPrior, U_collection: str = 'U', X_collection: str = 'X',
+                  log_prob_collection: str = 'log_prob', rng_stream: str = 'U'):
     """
     Convert a prior into a non-Bayesian parameter, that takes a single value in the model, but still has an associated
     log_prob. The parameter is registered as a `jaxns.get_parameter` with added `_param` name suffix.
@@ -402,44 +424,35 @@ def realise_prior(prior: AbstractPrior, param_collection: str, rng_stream: str):
 
     Args:
         prior: any prior
-        param_collection: the collection to register the parameter in.
-        rng_stream: the name of the random number generator stream to use for sampling.
+        U_collection: the collection to register the parameter in for U-space.
+        X_collection: the collection to register the parameter in for X-space.
+        rng_stream: the name of the random number generator stream to use for sampling U.
 
     Returns:
         A parameter representing the prior.
     """
     if prior.name is None:
         raise ValueError("Prior must have a name to be parametrised.")
-    name = f"{prior.name}_U"
     # Initialises at median of distribution using zeros, else unit-normal.
     initaliser = wrap_random(jax.random.uniform, rng_stream)
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
     U_base_param = get_parameter(
-        name=name,
+        name=prior.name,
         shape=prior.base_shape,
         dtype=prior.base_dtype,
         init=initaliser,
-        collection=param_collection
+        collection=U_collection
     )
-    return prior.forward(U_base_param)
-
-
-def sample_prior(prior: AbstractPrior, rng_stream: str):
-    """
-    Convert a prior into a non-Bayesian parameter, that takes a single value in the model, but still has an associated
-    log_prob. The parameter is registered as a `jaxns.get_parameter` with added `_param` name suffix.
-
-    To constrain the parameter we use a Normal parameter with centre on unit cube, and scale covering the whole cube,
-    as the base representation. This base representation covers the whole real line and be reliably used with SGD, etc.
-
-    Args:
-        prior: any prior
-        rng_stream: the name of the random number generator stream to use for sampling.
-
-    Returns:
-        A parameter representing the prior.
-    """
-    base_sampler = wrap_random(jax.random.uniform, rng_stream)
-    U_base_param = base_sampler(prior.base_shape, prior.base_dtype)
-    return prior.forward(U_base_param)
+    X_param = get_parameter(
+        name=prior.name,
+        collection=X_collection,
+        init=prior.forward(U_base_param)
+    )
+    # Register the log_prob as a parameter
+    _ = get_parameter(
+        name=prior.name,
+        collection=log_prob_collection,
+        init=prior.log_prob(X_param)
+    )
+    return X_param

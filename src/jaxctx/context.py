@@ -268,6 +268,46 @@ def set_parameter(name: str, collection: str, value: PT) -> PT:
     return value
 
 
+def set_state(name: str, collection: str, value: PT) -> PT:
+    """
+    Set a variable in a collection to a particular value.
+    If the name is not found in the collection then an error is raised.
+
+    Args:
+        name: the name of the state
+        collection: the collection of the parameter
+        value: the value to set
+
+    Returns:
+        The state variable as a jax.Array
+    """
+    params = global_context.get_collection(collection)
+    if name in params:
+        # Ensure same pytree def
+        tree_def = jax.tree.structure(params[name])
+        value_tree_def = jax.tree.structure(value)
+        if tree_def != value_tree_def:
+            raise ValueError(f"Expected state with tree_def {tree_def} got {value_tree_def}.")
+    params[name] = value
+
+
+def get_state(name: str, collection: str) -> PT:
+    """
+    Get a variable in a collection.
+
+    Args:
+        name: the name of the state
+        collection: the collection of the parameter
+
+    Returns:
+        The state variable as a jax.Array
+    """
+    params = global_context.get_collection(collection)
+    if name not in params:
+        raise ValueError(f"State {name} not found. It must be initialised before it can be set.")
+    return params[name]
+
+
 ExtParam = TypeVar('ExtParam')
 
 

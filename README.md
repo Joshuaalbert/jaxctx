@@ -8,5 +8,6 @@ Additional support added for probabilistic parameterisations based on priors.
 
 # Change Log
 
+21 July, 2025 -- 1.0.3 released with support for `jaxctx.prior` and `jaxctx.prior.Prior`.
 3 June, 2025 -- 1.0.2 prior constrained parameters released.
 2 June, 2025 -- 1.0.1 released with context API.
