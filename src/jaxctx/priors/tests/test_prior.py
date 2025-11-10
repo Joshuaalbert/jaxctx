@@ -43,21 +43,21 @@ def test_quick_unit():
 
 def test_prior():
     def model():
-        x = Prior(tfpd.Normal(loc=0., scale=1.), name='x').sample()
+        x = Prior(tfpd.Normal(loc=0., scale=1.), name='x').realise()
         y = Prior(tfpd.Uniform(low=0., high=1.), name='y').parameter()
         z = Prior(tfpd.Beta(concentration0=0.5, concentration1=1.), name='z').realise()
         return x, y, z
 
     transformed_model = transform(model)
-    params = transformed_model.init({'params': jax.random.PRNGKey(0)}, {}).collections
+    params = transformed_model.init({'params': jax.random.PRNGKey(0), 'U': jax.random.PRNGKey(1)}, {}).collections
     print(params)
 
-    print(transformed_model.apply({'params': jax.random.PRNGKey(0)}, params))
+    print(transformed_model.apply({}, params))
 
 
 def test_no_quantile_prior():
     def prior_model():
-        z = Prior(tfpd.VonMises(loc=0., concentration=1.)).sample()
+        z = Prior(tfpd.VonMises(loc=0., concentration=1.)).realise()
         return z
 
     with pytest.raises(ValueError):
