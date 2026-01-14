@@ -1,9 +1,8 @@
 import dataclasses
-import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import wraps
-from typing import Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic
+from typing import Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic, Union
 
 import jax
 
@@ -183,7 +182,7 @@ class GlobalContext:
 global_context = GlobalContext()
 
 PT = TypeVar('PT')
-InitType = Callable[[Tuple[int, ...], SupportsDType], PT] | Callable[[], PT]
+InitType = Union[jax.Array, Callable[[Tuple[int, ...], SupportsDType], PT], Callable[[], PT]]
 
 
 @contextmanager
@@ -223,7 +222,7 @@ def get_parameter(name: str, collection: str, shape: Optional[Tuple[int, ...]] =
         init: the initializer
 
     Returns:
-        The parameter variable as a jax.Array=
+        The parameter variable as a jax.Array
     """
     params = global_context.get_collection(collection)
     if name not in params:
@@ -233,8 +232,7 @@ def get_parameter(name: str, collection: str, shape: Optional[Tuple[int, ...]] =
             else:
                 new_param = init(shape, dtype)
         else:
-            warnings.warn(
-                "Using a constant initializer for state. This is not recommended as it may induce closure issues.")
+            # Beware of closure issues.
             new_param = init
         params[name] = new_param
 
@@ -256,7 +254,7 @@ def set_parameter(name: str, collection: str, value: PT) -> PT:
     """
     params = global_context.get_collection(collection)
     if name not in params:
-        raise ValueError(f"Parameter {name} not found. It must be initialised before it can be set.")
+        raise ValueError(f"Parameter {name} not found. It must be initialised with `get_parameter` before it can be set.")
     # Ensure same pytree def
     tree_def = jax.tree.structure(params[name])
     value_tree_def = jax.tree.structure(value)
@@ -271,7 +269,6 @@ def set_parameter(name: str, collection: str, value: PT) -> PT:
 def set_state(name: str, collection: str, value: PT) -> PT:
     """
     Set a variable in a collection to a particular value.
-    If the name is not found in the collection then an error is raised.
 
     Args:
         name: the name of the state
@@ -293,7 +290,7 @@ def set_state(name: str, collection: str, value: PT) -> PT:
 
 def get_state(name: str, collection: str) -> PT:
     """
-    Get a variable in a collection.
+    Get a state in a collection.
 
     Args:
         name: the name of the state

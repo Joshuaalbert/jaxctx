@@ -5,7 +5,6 @@ from typing import Tuple, Optional, Union, List
 import jax
 import numpy as np
 import tensorflow_probability.substrates.jax as tfp
-from jax import lax
 from jax import numpy as jnp
 
 from jaxctx import wrap_random, get_parameter
@@ -172,10 +171,13 @@ class AbstractPrior(ABC):
             log_prob = jax.lax.reshape(log_prob, ())
         return log_prob
 
-    def parameter(self, random_init=False, param_collection: str = 'params', rng_stream: str = 'params'):
+    def parameter(self, *, random_init=False, param_collection: str = 'params', U_collection: str = 'U', X_collection='X', log_prob_collection='log_prob',
+                  rng_stream: str = 'params'):
         """
         Convert a prior into a constrained parameter, that takes a single value in the model, but still has an associated
         log_prob. The parameter is registered into the corresponding collection and stream.
+
+        Intent is to use these for optimisation.
 
         Args:
             random_init: Whether to initialise the parameter randomly or at the median of the distribution.
@@ -186,9 +188,11 @@ class AbstractPrior(ABC):
             a parameter constrained to the prior distribution.
         """
         return prior_to_parameter(prior=self, random_init=random_init, param_collection=param_collection,
+                                  U_collection=U_collection, X_collection=X_collection,
+                                  log_prob_collection=log_prob_collection,
                                   rng_stream=rng_stream)
 
-    def realise(self, U_collection: str = 'U', X_collection: str = 'X', rng_stream: str = 'U'):
+    def realise(self, *, U_collection: str = 'U', X_collection: str = 'X', log_prob_collection='log_prob', rng_stream: str = 'U'):
         """
         Realise the prior distribution into a parameter.
 
@@ -200,7 +204,7 @@ class AbstractPrior(ABC):
         Returns:
             A parameter representing the prior.
         """
-        return realise_prior(prior=self, U_collection=U_collection, X_collection=X_collection, rng_stream=rng_stream)
+        return realise_prior(prior=self, U_collection=U_collection, X_collection=X_collection, log_prob_collection=log_prob_collection, rng_stream=rng_stream)
 
 
 class Prior(AbstractPrior):
@@ -320,7 +324,7 @@ def quick_unit(x: jax.Array) -> jax.Array:
     Returns:
         value in (0, 1) in open interval
     """
-    return 0.5 * (x / (1 + lax.abs(x)) + 1)
+    return 0.5 * (1 + jax.scipy.special.erf(x / np.sqrt(2)))
 
 
 def quick_unit_inverse(y: jax.Array) -> jax.Array:
@@ -333,16 +337,10 @@ def quick_unit_inverse(y: jax.Array) -> jax.Array:
     Returns:
         value in (-inf, inf) in open interval
     """
-    twoy = y + y
-
-    return jnp.where(
-        y >= 0.5,
-        (1 - twoy) / (twoy - 2),
-        1 - lax.reciprocal(twoy)
-    )
+    return np.sqrt(2) * jax.scipy.special.erfinv(2 * y - 1)
 
 
-def sample_quick_unit(key, shape, dtype):
+def sample_quick_unit_dist(key, shape, dtype):
     """
     Sample from the quick unit distribution.
 
@@ -355,16 +353,14 @@ def sample_quick_unit(key, shape, dtype):
         A jax.Array sampled from the quick unit distribution.
     """
 
-    def normal_cdf(x):
-        # CDF of normal distribution using scipy's erf function
-        return 0.5 * (1 + jax.scipy.special.erf(x / jnp.sqrt(2)))
-
-    return quick_unit_inverse(normal_cdf(jax.random.normal(key, shape, dtype)))
+    return jax.random.normal(key, shape, dtype)
 
 
 def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection: str = 'params',
-                       X_collection: str = 'X', log_prob_collection: str = 'log_prob', rng_stream: str = 'params'):
+                       U_collection: str = 'U', X_collection: str = 'X', log_prob_collection: str = 'log_prob', rng_stream: str = 'params'):
     """
+    Creates a parameter from a prior transformed from a homogeneous unconstrained base measure.
+
     Convert a prior into a non-Bayesian parameter, that takes a single value in the model, but still has an associated
     log_prob. The parameter is registered as a `jaxns.get_parameter` with added `_param` name suffix.
 
@@ -385,12 +381,12 @@ def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection
     # Initialises at median of distribution using zeros, else unit-normal.
 
     if random_init:
-        initaliser = wrap_random(sample_quick_unit, rng_stream)
+        initaliser = wrap_random(sample_quick_unit_dist, rng_stream)
     else:
         initaliser = jnp.zeros
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
-    norm_U_base_param = get_parameter(
+    N_base_param = get_parameter(
         name=prior.name,
         shape=prior.base_shape,
         dtype=prior.base_dtype,
@@ -398,7 +394,13 @@ def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection
         collection=param_collection
     )
     # transform [-inf, inf] -> [0,1]
-    U_base_param = quick_unit(norm_U_base_param)
+    U_base_param = get_parameter(
+        name=prior.name,
+        shape=prior.base_shape,
+        dtype=prior.base_dtype,
+        init=quick_unit(N_base_param),
+        collection=U_collection
+    )
     X_param = get_parameter(
         name=prior.name,
         collection=X_collection,
@@ -432,7 +434,7 @@ def realise_prior(prior: AbstractPrior, U_collection: str = 'U', X_collection: s
         A parameter representing the prior.
     """
     if prior.name is None:
-        raise ValueError("Prior must have a name to be parametrised.")
+        raise ValueError("Prior must have a name to be realised.")
     # Initialises at median of distribution using zeros, else unit-normal.
     initaliser = wrap_random(jax.random.uniform, rng_stream)
     if prior.base_ndims == 0:
