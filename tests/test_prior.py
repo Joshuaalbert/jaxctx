@@ -2,7 +2,7 @@ import jax
 import numpy as np
 import pytest
 from jax import numpy as jnp
-from jax._src.scipy.special import logit
+from jax.scipy import special as jsp
 
 from jaxctx import transform
 from jaxctx.priors.prior import quick_unit, quick_unit_inverse, Prior, tfpd, distribution_chain
@@ -33,12 +33,64 @@ def test_quick_unit():
             g(x).block_until_ready()
         print(f"{f.__name__} {time.time() - t0}s")
 
-    for f in [quick_unit_inverse, logit]:
+    for f in [quick_unit_inverse, jsp.logit]:
         g = jax.jit(f).lower(y).compile()
         t0 = time.time()
         for _ in range(1000):
             g(y).block_until_ready()
         print(f"{f.__name__} {time.time() - t0}s")
+
+
+def _tail_threshold(forward, inverse, dtype, max_x: float = 1e4, iters: int = 80) -> float:
+    def _is_valid(x_value: float) -> bool:
+        x_arr = jnp.asarray(x_value, dtype=dtype)
+        y = forward(x_arr)
+        x_rec = inverse(y)
+        return bool((y > 0) & (y < 1) & jnp.isfinite(y) & jnp.isfinite(x_rec))
+
+    lo = 0.0
+    hi = 1.0
+    while hi < max_x and _is_valid(hi):
+        lo = hi
+        hi *= 2.0
+
+    if _is_valid(hi):
+        return float(hi)
+
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if _is_valid(mid):
+            lo = mid
+        else:
+            hi = mid
+    return float(lo)
+
+
+def test_quick_unit_tail_saturation():
+    jax.config.update("jax_enable_x64", True)
+    assert jax.config.read("jax_enable_x64")
+
+    thresholds = {}
+    for dtype in (jnp.float32, jnp.float64):
+        thresholds[(dtype, "sigmoid")] = _tail_threshold(
+            jax.nn.sigmoid,
+            jsp.logit,
+            dtype
+        )
+        thresholds[(dtype, "ndtr")] = _tail_threshold(
+            jsp.ndtr,
+            jsp.ndtri,
+            dtype
+        )
+        print(f"{dtype} sigmoid tail threshold: {thresholds[(dtype, 'sigmoid')]}")
+        print(f"{dtype} ndtr tail threshold: {thresholds[(dtype, 'ndtr')]}")
+
+        assert thresholds[(dtype, "sigmoid")] > 0
+        assert thresholds[(dtype, "ndtr")] > 0
+        assert thresholds[(dtype, "sigmoid")] >= thresholds[(dtype, "ndtr")]
+
+    assert thresholds[(jnp.float64, "sigmoid")] >= thresholds[(jnp.float32, "sigmoid")]
+    assert thresholds[(jnp.float64, "ndtr")] >= thresholds[(jnp.float32, "ndtr")]
 
 
 def test_prior():
@@ -166,4 +218,3 @@ def test_various_collections():
 
     response = transformed_model.apply({'params': jax.random.PRNGKey(2), 'U': jax.random.PRNGKey(3)}, params)
     print(response)
-

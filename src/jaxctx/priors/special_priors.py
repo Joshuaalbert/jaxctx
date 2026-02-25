@@ -46,6 +46,7 @@ class Bernoulli(AbstractPrior):
         return tuple(self.dist.batch_shape_tensor()) + tuple(self.dist.event_shape_tensor())
 
     def _forward(self, U):
+        U = U.astype(jnp.result_type(U.dtype, self.dist.dtype))
         return self._quantile(U)
 
     def _inverse(self, X):
@@ -85,6 +86,7 @@ class Beta(AbstractPrior):
         return tuple(self.dist.batch_shape_tensor()) + tuple(self.dist.event_shape_tensor())
 
     def _forward(self, U):
+        U = U.astype(jnp.result_type(U.dtype, self.dist.dtype))
         return self._quantile(U)
 
     def _inverse(self, X):
@@ -128,6 +130,7 @@ class Categorical(AbstractPrior):
         return tuple(self.dist.batch_shape_tensor()) + tuple(self.dist.event_shape_tensor())
 
     def _forward(self, U):
+        U = U.astype(jnp.result_type(U.dtype, self.dist.dtype))
         if self._parametrisation == 'gumbel_max':
             return self._quantile_gumbelmax(U)
         elif self._parametrisation == 'cdf':
@@ -360,6 +363,7 @@ class Poisson(AbstractPrior):
         return tuple(self.dist.batch_shape_tensor()) + tuple(self.dist.event_shape_tensor())
 
     def _forward(self, U):
+        U = U.astype(jnp.result_type(U.dtype, self.dist.dtype))
         return self._quantile(U)
 
     def _inverse(self, X):
@@ -413,6 +417,7 @@ class UnnormalisedDirichlet(AbstractPrior):
         return tuple(self._dirichlet_dist.batch_shape_tensor()) + tuple(self._dirichlet_dist.event_shape_tensor())
 
     def _forward(self, U):
+        U = U.astype(jnp.result_type(U.dtype, self._gamma_dist.dtype))
         return self._quantile(U)
 
     def _inverse(self, X):

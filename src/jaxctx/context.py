@@ -2,9 +2,12 @@ import dataclasses
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import wraps
-from typing import Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic, Union
+from typing import Any, Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic, Union, Iterator
 
 import jax
+from jax._src.typing import SupportsDType
+
+from jaxctx.priors.types import PRNGKey
 
 __all__ = [
     'get_parameter',
@@ -14,26 +17,23 @@ __all__ = [
     'wrap_random',
     'next_rng_key',
     'scope',
-    'CtxParams'
+    'CtxParams',
+    'ScopedDict'
 ]
-
-from jax._src.typing import SupportsDType
-
-from jaxctx.priors.types import PRNGKey
 
 
 class ScopedDict:
     """
-    prefixes all keys with a given scope {scope}.{key}
+    Nested dictionary keyed by scopes. Non-terminal nodes are scopes (dicts),
+    terminal nodes are values.
     """
 
     def __init__(self, _dict=None, _scopes=None):
-        self._scopes: List[str] = _scopes or []
-        self._dict = _dict or dict()
+        self._scopes: List[str] = [] if _scopes is None else _scopes
+        self._dict = {} if _dict is None else _dict
 
     def with_scopes(self, scopes: List[str]) -> 'ScopedDict':
-        self._scopes = scopes
-        return self
+        return ScopedDict(_dict=self._dict, _scopes=list(scopes))
 
     @property
     def scope_prefix(self):
@@ -45,46 +45,153 @@ class ScopedDict:
     def __repr__(self):
         return f"ScopedDict(scopes={repr(self._scopes)}, dict={repr(self._dict)})"
 
+    def _get_scope_dict(self, create: bool = False) -> Optional[Dict[str, Any]]:
+        node = self._dict
+        for scope in self._scopes:
+            if scope not in node:
+                if not create:
+                    return None
+                node[scope] = {}
+            child = node[scope]
+            if not isinstance(child, dict):
+                raise ValueError(f"Scope '{scope}' collides with existing leaf.")
+            node = child
+        return node
+
+    @staticmethod
+    def _split_dotted(dotted_key: str) -> List[str]:
+        if dotted_key.startswith('.'):
+            dotted_key = dotted_key[1:]
+        if dotted_key == "":
+            return []
+        parts = dotted_key.split('.')
+        if any(part == "" for part in parts):
+            raise ValueError("Dotted key contains empty scope segment.")
+        return parts
+
+    def get_dotted(self, dotted_key: str):
+        """
+        Lookup a value from the root using dotted notation.
+        Leading '.' is optional and ignored.
+        """
+        parts = self._split_dotted(dotted_key)
+        node = self._dict
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                raise KeyError(dotted_key)
+            node = node[part]
+        return node
+
+    def iter_items(self):
+        """
+        Iterate over leaf values yielding (dotted_key, value).
+        Keys are returned relative to the root, prefixed by current scopes.
+        """
+        scope_dict = self._get_scope_dict(create=False)
+        if scope_dict is None:
+            return iter(())
+
+        prefix = list(self._scopes)
+
+        def _walk(node: Dict[str, Any], path_prefix: List[str]):
+            for key in sorted(node.keys()):
+                value = node[key]
+                if isinstance(value, dict):
+                    yield from _walk(value, path_prefix + [key])
+                else:
+                    dotted_key = '.'.join(path_prefix + [key])
+                    yield dotted_key, value
+
+        return _walk(scope_dict, prefix)
+
     def __getitem__(self, item):
-        return self._dict[f"{self.scope_prefix}.{item}"]
+        scope_dict = self._get_scope_dict(create=False)
+        if scope_dict is None:
+            raise KeyError(item)
+        return scope_dict[item]
 
     def __setitem__(self, key, value):
-        self._dict[f"{self.scope_prefix}.{key}"] = value
+        scope_dict = self._get_scope_dict(create=True)
+        if scope_dict is None:
+            raise ValueError("Scope path could not be resolved.")
+        if key in scope_dict:
+            existing = scope_dict[key]
+            if isinstance(existing, dict) and not isinstance(value, dict):
+                raise ValueError(f"Cannot overwrite scope '{key}' with a leaf value.")
+            if not isinstance(existing, dict) and isinstance(value, dict):
+                raise ValueError(f"Cannot overwrite leaf '{key}' with a scope.")
+        scope_dict[key] = value
 
     def __contains__(self, item):
-        return f"{self.scope_prefix}.{item}" in self._dict
+        scope_dict = self._get_scope_dict(create=False)
+        if scope_dict is None:
+            return False
+        return item in scope_dict
 
     def __iter__(self):
-        return iter(self._dict)
+        scope_dict = self._get_scope_dict(create=False)
+        if scope_dict is None:
+            return iter(())
+        return iter(scope_dict)
 
     def __len__(self):
-        return len(self._dict)
+        scope_dict = self._get_scope_dict(create=False)
+        if scope_dict is None:
+            return 0
+        return len(scope_dict)
 
     def keys(self):
-        return self._dict.keys()
+        scope_dict = self._get_scope_dict(create=False) or {}
+        return scope_dict.keys()
 
     def values(self):
-        return self._dict.values()
+        scope_dict = self._get_scope_dict(create=False) or {}
+        return scope_dict.values()
 
     def items(self):
-        return self._dict.items()
+        scope_dict = self._get_scope_dict(create=False) or {}
+        return scope_dict.items()
 
 
 # Add as pytree type
 
+def _flatten_mapping(mapping: Dict[str, Any]) -> Tuple[List[Any], Tuple[Tuple[str, Any], ...]]:
+    children: List[Any] = []
+    structure: List[Tuple[str, Any]] = []
+    for key in sorted(mapping.keys()):
+        value = mapping[key]
+        if isinstance(value, dict):
+            sub_children, sub_structure = _flatten_mapping(value)
+            children.extend(sub_children)
+            structure.append((key, sub_structure))
+        else:
+            children.append(value)
+            structure.append((key, None))
+    return children, tuple(structure)
+
+
+def _unflatten_mapping(structure: Tuple[Tuple[str, Any], ...], children_iter: Iterator[Any]) -> Dict[str, Any]:
+    mapping: Dict[str, Any] = {}
+    for key, sub_structure in structure:
+        if sub_structure is None:
+            mapping[key] = next(children_iter)
+        else:
+            mapping[key] = _unflatten_mapping(sub_structure, children_iter)
+    return mapping
+
 def scoped_dict_flatten(scoped_dict: ScopedDict):
+    children, structure = _flatten_mapping(scoped_dict._dict)
     return (
-        [
-            scoped_dict._dict
-        ],
-        (scoped_dict._scopes,)
+        children,
+        (structure, tuple(scoped_dict._scopes))
     )
 
 
 def scoped_dict_unflatten(aux_data, children):
-    [_dict] = children
-    (_scopes,) = aux_data
-    return ScopedDict(_dict=_dict, _scopes=_scopes)
+    structure, scopes = aux_data
+    children_iter = iter(children)
+    _dict = _unflatten_mapping(structure, children_iter)
+    return ScopedDict(_dict=_dict, _scopes=list(scopes))
 
 
 jax.tree_util.register_pytree_node(

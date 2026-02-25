@@ -12,6 +12,8 @@ from jaxctx.priors.types import FloatArray, IntArray, BoolArray, ComplexArray
 
 tfpd = tfp.distributions
 
+QUICK_UNIT_SCALE = 2.2
+
 CoDomain = ComplexArray | FloatArray | IntArray | BoolArray
 
 
@@ -294,6 +296,8 @@ class TFPDistributionChain:
 
     def forward(self, U) -> Union[FloatArray, IntArray, BoolArray]:
         dist = self.dist_chain[0]
+        # cast U to the correct dtype for the distribution
+        U = U.astype(jnp.result_type(U.dtype, dist.dtype))
         if isinstance(dist, tfpd.Sample):
             dist = dist.distribution
         X = dist.quantile(U)
@@ -324,7 +328,7 @@ def quick_unit(x: jax.Array) -> jax.Array:
     Returns:
         value in (0, 1) in open interval
     """
-    return 0.5 * (1 + jax.scipy.special.erf(x / np.sqrt(2)))
+    return jax.nn.sigmoid(x / QUICK_UNIT_SCALE)
 
 
 def quick_unit_inverse(y: jax.Array) -> jax.Array:
@@ -337,7 +341,7 @@ def quick_unit_inverse(y: jax.Array) -> jax.Array:
     Returns:
         value in (-inf, inf) in open interval
     """
-    return np.sqrt(2) * jax.scipy.special.erfinv(2 * y - 1)
+    return QUICK_UNIT_SCALE * jax.scipy.special.logit(y)
 
 
 def sample_quick_unit_dist(key, shape, dtype):

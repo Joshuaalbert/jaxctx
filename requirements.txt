@@ -1,2 +1,2 @@
 jax
-tensorflow_probability
+tfp_nightly
