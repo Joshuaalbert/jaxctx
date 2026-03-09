@@ -173,7 +173,8 @@ class AbstractPrior(ABC):
             log_prob = jax.lax.reshape(log_prob, ())
         return log_prob
 
-    def parameter(self, *, random_init=False, param_collection: str = 'params', U_collection: str = 'U', X_collection='X', log_prob_collection='log_prob',
+    def parameter(self, *, init_value: FloatArray | None = None, random_init=False, param_collection: str = 'params',
+                  U_collection: str = 'U', X_collection='X', log_prob_collection='log_prob',
                   rng_stream: str = 'params'):
         """
         Convert a prior into a constrained parameter, that takes a single value in the model, but still has an associated
@@ -189,12 +190,14 @@ class AbstractPrior(ABC):
         Returns:
             a parameter constrained to the prior distribution.
         """
-        return prior_to_parameter(prior=self, random_init=random_init, param_collection=param_collection,
+        return prior_to_parameter(prior=self, init_value=init_value, random_init=random_init,
+                                  param_collection=param_collection,
                                   U_collection=U_collection, X_collection=X_collection,
                                   log_prob_collection=log_prob_collection,
                                   rng_stream=rng_stream)
 
-    def realise(self, *, U_collection: str = 'U', X_collection: str = 'X', log_prob_collection='log_prob', rng_stream: str = 'U'):
+    def realise(self, *, U_collection: str = 'U', X_collection: str = 'X', log_prob_collection='log_prob',
+                rng_stream: str = 'U'):
         """
         Realise the prior distribution into a parameter.
 
@@ -206,7 +209,8 @@ class AbstractPrior(ABC):
         Returns:
             A parameter representing the prior.
         """
-        return realise_prior(prior=self, U_collection=U_collection, X_collection=X_collection, log_prob_collection=log_prob_collection, rng_stream=rng_stream)
+        return realise_prior(prior=self, U_collection=U_collection, X_collection=X_collection,
+                             log_prob_collection=log_prob_collection, rng_stream=rng_stream)
 
 
 class Prior(AbstractPrior):
@@ -346,7 +350,8 @@ def quick_unit_inverse(y: jax.Array) -> jax.Array:
 
 def sample_quick_unit_dist(key, shape, dtype):
     """
-    Sample from the quick unit distribution.
+    Sample from the quick unit distribution in the param space, a logit-normal distribution with mean 0 and scale
+    QUICK_UNIT_SCALE.
 
     Args:
         key: PRNGKey to use.
@@ -360,8 +365,10 @@ def sample_quick_unit_dist(key, shape, dtype):
     return jax.random.normal(key, shape, dtype)
 
 
-def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection: str = 'params',
-                       U_collection: str = 'U', X_collection: str = 'X', log_prob_collection: str = 'log_prob', rng_stream: str = 'params'):
+def prior_to_parameter(prior: AbstractPrior, init_value: FloatArray | None = None, random_init: bool = False,
+                       param_collection: str = 'params',
+                       U_collection: str = 'U', X_collection: str = 'X', log_prob_collection: str = 'log_prob',
+                       rng_stream: str = 'params'):
     """
     Creates a parameter from a prior transformed from a homogeneous unconstrained base measure.
 
@@ -382,19 +389,22 @@ def prior_to_parameter(prior: AbstractPrior, random_init: bool, param_collection
     """
     if prior.name is None:
         raise ValueError("Prior must have a name to be parametrised.")
-    # Initialises at median of distribution using zeros, else unit-normal.
-
-    if random_init:
-        initaliser = wrap_random(sample_quick_unit_dist, rng_stream)
-    else:
-        initaliser = jnp.zeros
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
+    if init_value is not None:
+        # tranform: X -> U -> N
+        initialiser = quick_unit_inverse(jnp.clip(prior.inverse(init_value), 1e-6, 1 - 1e-6))
+    else:
+        if random_init:
+            initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
+        else:
+            # Initialises at median of distribution using zeros.
+            initialiser = jnp.zeros
     N_base_param = get_parameter(
         name=prior.name,
         shape=prior.base_shape,
         dtype=prior.base_dtype,
-        init=initaliser,
+        init=initialiser,
         collection=param_collection
     )
     # transform [-inf, inf] -> [0,1]
