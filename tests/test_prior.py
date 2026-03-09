@@ -98,15 +98,19 @@ def test_prior():
         x = Prior(tfpd.Normal(loc=0., scale=1.), name='x').realise()
         y = Prior(tfpd.Uniform(low=0., high=1.), name='y').parameter()
         y_rand = Prior(tfpd.Uniform(low=0., high=1.), name='y_rand').parameter(random_init=True)
-        y_init = Prior(tfpd.Uniform(low=0., high=1.), name='y_init').parameter(init_value=0.75)
+        y_init = Prior(tfpd.Uniform(low=0., high=1.), name='y_init').parameter(init=0.75)
+        y_init_callable = Prior(tfpd.Uniform(low=0., high=1.), name='y_init_callable').parameter(
+            init=lambda key, shape, dtype: 0.75 * jnp.ones(shape, dtype))
         z = Prior(tfpd.Beta(concentration0=0.5, concentration1=1.), name='z').realise()
-        return x, y, y_rand, y_init, z
+        return x, y, y_rand, y_init, y_init_callable, z
 
     transformed_model = transform(model)
     params = transformed_model.init({'params': jax.random.PRNGKey(0), 'U': jax.random.PRNGKey(1)}, {}).collections
     print(params)
     y_init = params['X']['y_init']
     assert np.isclose(y_init, 0.75, atol=1e-5)
+    y_init_callable = params['X']['y_init_callable']
+    assert np.isclose(y_init_callable, 0.75, atol=1e-5)
 
     print(transformed_model.apply({}, params))
 
@@ -208,6 +212,7 @@ def test_priors():
     assert d.forward(jnp.zeros(d.base_shape, jnp.float32)).shape == d.shape
     assert d.base_shape == (5,)
     assert d.shape == (5,)
+
 
 def test_various_collections():
     # We want to be able to create a model with

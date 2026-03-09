@@ -1,6 +1,7 @@
 import warnings
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional, Union, List
+from functools import partial
+from typing import Tuple, Optional, Union, List, Callable
 
 import jax
 import numpy as np
@@ -173,7 +174,7 @@ class AbstractPrior(ABC):
             log_prob = jax.lax.reshape(log_prob, ())
         return log_prob
 
-    def parameter(self, *, init_value: FloatArray | None = None, random_init=False, param_collection: str = 'params',
+    def parameter(self, *, init: FloatArray | Callable|None = None, random_init=False, param_collection: str = 'params',
                   U_collection: str = 'U', X_collection='X', log_prob_collection='log_prob',
                   rng_stream: str = 'params'):
         """
@@ -183,6 +184,7 @@ class AbstractPrior(ABC):
         Intent is to use these for optimisation.
 
         Args:
+            init: optional initial value or callable, giving the initial value in X-space.
             random_init: Whether to initialise the parameter randomly or at the median of the distribution.
             param_collection: The collection to register the parameter in.
             rng_stream: The name of the random number generator stream to use for sampling.
@@ -190,7 +192,7 @@ class AbstractPrior(ABC):
         Returns:
             a parameter constrained to the prior distribution.
         """
-        return prior_to_parameter(prior=self, init_value=init_value, random_init=random_init,
+        return prior_to_parameter(prior=self, init=init, random_init=random_init,
                                   param_collection=param_collection,
                                   U_collection=U_collection, X_collection=X_collection,
                                   log_prob_collection=log_prob_collection,
@@ -365,7 +367,7 @@ def sample_quick_unit_dist(key, shape, dtype):
     return jax.random.normal(key, shape, dtype)
 
 
-def prior_to_parameter(prior: AbstractPrior, init_value: FloatArray | None = None, random_init: bool = False,
+def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None = None, random_init: bool = False,
                        param_collection: str = 'params',
                        U_collection: str = 'U', X_collection: str = 'X', log_prob_collection: str = 'log_prob',
                        rng_stream: str = 'params'):
@@ -391,9 +393,21 @@ def prior_to_parameter(prior: AbstractPrior, init_value: FloatArray | None = Non
         raise ValueError("Prior must have a name to be parametrised.")
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
-    if init_value is not None:
+    if init is not None:
         # tranform: X -> U -> N
-        initialiser = quick_unit_inverse(jnp.clip(prior.inverse(init_value), 1e-6, 1 - 1e-6))
+        if callable(init):
+            @partial(wrap_random, rng_stream=rng_stream)
+            def initialiser(key, shape, dtype):
+                X = jnp.asarray(init(key, shape, dtype))
+                if X.shape != shape:
+                    raise ValueError(f"Initialiser callable for {prior.name} returned shape {np.shape(X)}, expected {shape}.")
+                if X.dtype != dtype:
+                    raise ValueError(f"Initialiser callable for {prior.name} returned dtype {X.dtype}, expected {dtype}.")
+                U = prior.inverse(X)
+                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
+                return N
+        else:
+            initialiser = quick_unit_inverse(jnp.clip(prior.inverse(init), 1e-6, 1 - 1e-6))
     else:
         if random_init:
             initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
