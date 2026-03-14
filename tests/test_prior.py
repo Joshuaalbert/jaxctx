@@ -5,7 +5,34 @@ from jax import numpy as jnp
 from jax.scipy import special as jsp
 
 from jaxctx import transform
-from jaxctx.priors.prior import quick_unit, quick_unit_inverse, Prior, tfpd, distribution_chain
+from jaxctx.priors.prior import AbstractPrior, quick_unit, quick_unit_inverse, Prior, tfpd, distribution_chain
+
+
+class SpyPrior(AbstractPrior):
+    def __init__(self, state, name="p"):
+        super().__init__(name=name, base_dtype=jnp.float32)
+        self._state = state
+
+    def _dtype(self):
+        return jnp.float32
+
+    def _base_shape(self):
+        return ()
+
+    def _shape(self):
+        return ()
+
+    def _forward(self, U):
+        return U
+
+    def _inverse(self, X):
+        self._state["inverse_calls"] += 1
+        if self._state["mode"] == "bad":
+            raise RuntimeError("inverse() was called during apply")
+        return X
+
+    def _log_prob(self, X):
+        return jnp.asarray(0.0, dtype=jnp.float32)
 
 
 def test_quick_unit():
@@ -227,3 +254,105 @@ def test_various_collections():
 
     response = transformed_model.apply({'params': jax.random.PRNGKey(2), 'U': jax.random.PRNGKey(3)}, params)
     print(response)
+
+
+def test_prior_parameter_const_init_does_not_touch_inverse_on_apply():
+    state = {"mode": "safe", "inverse_calls": 0}
+    prior = SpyPrior(state, name="p")
+
+    def f(x):
+        p = prior.parameter(init=jnp.asarray(0.5, dtype=jnp.float32))
+        return x + p
+
+    tf = transform(f)
+    init_res = tf.init({}, {}, jnp.asarray(1.0, dtype=jnp.float32))
+
+    assert state["inverse_calls"] == 1
+
+    state["mode"] = "bad"
+    out = tf.apply({}, {"params": init_res.collections["params"]}, jnp.asarray(2.0, dtype=jnp.float32)).fn_val
+
+    assert out == jnp.asarray(2.5, dtype=jnp.float32)
+    assert state["inverse_calls"] == 1
+
+
+def test_prior_parameter_traced_const_init_does_not_touch_inverse_on_jitted_apply():
+    state = {"mode": "safe", "inverse_calls": 0}
+    prior = SpyPrior(state, name="p")
+
+    def f(x):
+        init_value = jnp.sin(x) + jnp.asarray(0.5, dtype=jnp.float32)
+        p = prior.parameter(init=init_value)
+        return x + p
+
+    tf = transform(f)
+    init_res = tf.init({}, {}, jnp.asarray(1.0, dtype=jnp.float32))
+
+    assert state["inverse_calls"] == 1
+
+    state["mode"] = "bad"
+    apply_fn = jax.jit(lambda x, p: tf.apply({}, {"params": p}, x).fn_val)
+    out = apply_fn(jnp.asarray(2.0, dtype=jnp.float32), init_res.collections["params"])
+
+    assert out.shape == ()
+    assert state["inverse_calls"] == 1
+
+
+def test_prior_parameter_callable_init_does_not_touch_inverse_on_apply():
+    state = {"mode": "safe", "inverse_calls": 0}
+    prior = SpyPrior(state, name="p")
+
+    def f(x):
+        def init_fn(key, shape, dtype):
+            del key, shape
+            return jnp.asarray(0.5, dtype=dtype)
+
+        p = prior.parameter(init=init_fn)
+        return x + p
+
+    tf = transform(f)
+    init_res = tf.init({"params": jax.random.PRNGKey(0)}, {}, jnp.asarray(1.0, dtype=jnp.float32))
+
+    assert state["inverse_calls"] == 1
+
+    state["mode"] = "bad"
+    out = tf.apply({}, {"params": init_res.collections["params"]}, jnp.asarray(2.0, dtype=jnp.float32)).fn_val
+
+    assert out == jnp.asarray(2.5, dtype=jnp.float32)
+    assert state["inverse_calls"] == 1
+
+
+def test_prior_parameter_split_jit_keeps_sin_in_init_hlo_only():
+    state = {"mode": "safe", "inverse_calls": 0}
+    prior = SpyPrior(state, name="p")
+
+    def f(x):
+        p = prior.parameter(init=jnp.sin(x))
+        return x + p
+
+    @jax.jit
+    def init_fn(x):
+        tf = transform(f)
+        return tf.init({}, {}, x).collections["params"]
+
+    @jax.jit
+    def apply_fn(x, params):
+        tf = transform(f)
+        return tf.apply({}, {"params": params}, x).fn_val
+
+    x = jnp.asarray(1.0, dtype=jnp.float32)
+    params = init_fn(x)
+
+    init_hlo = init_fn.lower(x).compiler_ir(dialect="hlo").as_hlo_text().lower()
+    apply_hlo = apply_fn.lower(x, params).compiler_ir(dialect="hlo").as_hlo_text().lower()
+
+    assert "sine" in init_hlo or "sin" in init_hlo
+    assert "sine" not in apply_hlo and "sin" not in apply_hlo
+
+    inverse_calls_before_apply = state["inverse_calls"]
+
+    state["mode"] = "bad"
+    out = apply_fn(x, params)
+
+    assert out.shape == ()
+    assert state["inverse_calls"] == inverse_calls_before_apply

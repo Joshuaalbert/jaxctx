@@ -407,7 +407,12 @@ def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None 
                 N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
                 return N
         else:
-            initialiser = quick_unit_inverse(jnp.clip(prior.inverse(init), 1e-6, 1 - 1e-6))
+            def initialiser(shape, dtype):
+                del shape, dtype
+                X = jnp.asarray(init)
+                U = prior.inverse(X)
+                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
+                return N
     else:
         if random_init:
             initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
