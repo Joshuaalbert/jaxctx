@@ -25,7 +25,7 @@ class AbstractPrior(ABC):
 
     def __init__(self, name: str | None, base_dtype):
         self._name = name
-        self._base_dtype = base_dtype
+        self._base_dtype = jax.dtypes.canonicalize_dtype(base_dtype)
 
     def __repr__(self):
         return f"{self.name if self.name is not None else '*'}\t{self.base_shape} -> {self.shape} {self.dtype}"
