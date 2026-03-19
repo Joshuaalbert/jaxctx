@@ -68,6 +68,47 @@ def test_quick_unit():
         print(f"{f.__name__} {time.time() - t0}s")
 
 
+@pytest.mark.parametrize("base_dtype", [jnp.float32, jnp.float64])
+def test_prior_base_dtype_works_in_current_jax_mode(base_dtype):
+    effective_dtype = jax.dtypes.canonicalize_dtype(base_dtype)
+
+    parameter_prior = Prior(
+        tfpd.Normal(
+            loc=jnp.asarray(0., dtype=jnp.float32),
+            scale=jnp.asarray(1., dtype=jnp.float32)
+        ),
+        name='x',
+        base_dtype=base_dtype
+    )
+    realised_prior = Prior(
+        tfpd.Normal(
+            loc=jnp.asarray(0., dtype=jnp.float32),
+            scale=jnp.asarray(1., dtype=jnp.float32)
+        ),
+        name='y',
+        base_dtype=base_dtype
+    )
+
+    assert parameter_prior.base_dtype == effective_dtype
+    assert realised_prior.base_dtype == effective_dtype
+
+    def model():
+        x = parameter_prior.parameter(random_init=True)
+        y = realised_prior.realise()
+        return x, y
+
+    tf = transform(model)
+    init_res = tf.init({'params': jax.random.PRNGKey(0), 'U': jax.random.PRNGKey(1)}, {})
+
+    assert init_res.collections['params']['x'].dtype == effective_dtype
+    assert init_res.collections['U']['x'].dtype == effective_dtype
+    assert init_res.collections['U']['y'].dtype == effective_dtype
+
+    apply_res = tf.apply({}, init_res.collections)
+    assert apply_res.fn_val[0].shape == ()
+    assert apply_res.fn_val[1].shape == ()
+
+
 def _tail_threshold(forward, inverse, dtype, max_x: float = 1e4, iters: int = 80) -> float:
     def _is_valid(x_value: float) -> bool:
         x_arr = jnp.asarray(x_value, dtype=dtype)

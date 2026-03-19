@@ -82,6 +82,31 @@ class ScopedDict:
             node = node[part]
         return node
 
+    def set_dotted(self, dotted_key: str, value):
+        """
+        Set a value from the root using dotted notation.
+        Leading '.' is optional and ignored.
+        """
+        parts = self._split_dotted(dotted_key)
+        if not parts:
+            raise ValueError("Dotted key cannot be empty.")
+        node = self._dict
+        for part in parts[:-1]:
+            if part not in node:
+                node[part] = {}
+            child = node[part]
+            if not isinstance(child, dict):
+                raise ValueError(f"Scope '{part}' collides with existing leaf.")
+            node = child
+        last_part = parts[-1]
+        if last_part in node:
+            existing = node[last_part]
+            if isinstance(existing, dict) and not isinstance(value, dict):
+                raise ValueError(f"Cannot overwrite scope '{last_part}' with a leaf value.")
+            if not isinstance(existing, dict) and isinstance(value, dict):
+                raise ValueError(f"Cannot overwrite leaf '{last_part}' with a scope.")
+        node[last_part] = value
+
     def iter_items(self):
         """
         Iterate over leaf values yielding (dotted_key, value).

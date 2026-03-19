@@ -1,5 +1,6 @@
 import jax
 import numpy as np
+import pytest
 from jax import numpy as jnp
 
 from jaxctx.context import get_parameter, wrap_random, set_parameter, transform, ScopedDict, scope
@@ -70,3 +71,54 @@ def test_scoped_dict_nested_and_dotted():
             items['layer.y'],
             response.collections['params']['layer']['y']
         )
+
+
+def test_scoped_dict_set_dotted():
+    scoped = ScopedDict()
+
+    scoped.set_dotted('layer.weight', 1)
+    scoped.set_dotted('.layer.bias', 2)
+
+    assert scoped.to_dict() == {'layer': {'weight': 1, 'bias': 2}}
+    assert scoped.get_dotted('layer.weight') == 1
+    assert scoped.get_dotted('.layer.bias') == 2
+
+    with pytest.raises(ValueError, match="Dotted key cannot be empty."):
+        scoped.set_dotted('', 3)
+
+    with pytest.raises(ValueError, match="Cannot overwrite scope 'layer' with a leaf value."):
+        scoped.set_dotted('layer', 4)
+
+    leaf_collision = ScopedDict({'layer': 1})
+    with pytest.raises(ValueError, match="Scope 'layer' collides with existing leaf."):
+        leaf_collision.set_dotted('layer.weight', 2)
+
+    with pytest.raises(ValueError, match="Cannot overwrite leaf 'weight' with a scope."):
+        scoped.set_dotted('layer.weight', {'value': 5})
+
+
+def test_scoped_dict_iter_items_order_and_scopes():
+    scoped = ScopedDict({
+        'b': 2,
+        'a': {
+            'd': 4,
+            'c': 3,
+        },
+        'z': {
+            'alpha': 1,
+        },
+    })
+
+    assert list(scoped.iter_items()) == [
+        ('a.c', 3),
+        ('a.d', 4),
+        ('b', 2),
+        ('z.alpha', 1),
+    ]
+
+    assert list(scoped.with_scopes(['a']).iter_items()) == [
+        ('a.c', 3),
+        ('a.d', 4),
+    ]
+
+    assert list(scoped.with_scopes(['missing']).iter_items()) == []
