@@ -1,7 +1,7 @@
 import warnings
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Tuple, Optional, Union, List, Callable
+from typing import Tuple, Optional, Union, List, Callable, Sequence
 
 import jax
 import numpy as np
@@ -9,6 +9,7 @@ import tensorflow_probability.substrates.jax as tfp
 from jax import numpy as jnp
 
 from jaxctx import wrap_random, get_parameter
+from jaxctx.context import set_state
 from jaxctx.priors.types import FloatArray, IntArray, BoolArray, ComplexArray
 
 tfpd = tfp.distributions
@@ -367,6 +368,169 @@ def sample_quick_unit_dist(key, shape, dtype):
     return jax.random.normal(key, shape, dtype)
 
 
+def _validate_parameter_prior(prior: AbstractPrior):
+    if prior.name is None:
+        raise ValueError("Prior must have a name to be parametrised.")
+    if prior.base_ndims == 0:
+        warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
+
+
+def _parameter_initialiser(prior: AbstractPrior, init: FloatArray | Callable | None, random_init: bool,
+                           rng_stream: str):
+    if init is not None:
+        # transform: X -> U -> N
+        if callable(init):
+            @partial(wrap_random, rng_stream=rng_stream)
+            def initialiser(key, shape, dtype):
+                X = jnp.asarray(init(key, shape, dtype))
+                if X.shape != shape:
+                    raise ValueError(f"Initialiser callable for {prior.name} returned shape {np.shape(X)}, expected {shape}.")
+                if X.dtype != dtype:
+                    raise ValueError(f"Initialiser callable for {prior.name} returned dtype {X.dtype}, expected {dtype}.")
+                U = prior.inverse(X)
+                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
+                return N
+        else:
+            def initialiser(shape, dtype):
+                del shape, dtype
+                X = jnp.asarray(init)
+                U = prior.inverse(X)
+                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
+                return N
+    elif random_init:
+        initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
+    else:
+        # Initialises at median of distribution using zeros.
+        initialiser = jnp.zeros
+    return initialiser
+
+
+class ParameterPack:
+    """
+    Packs several prior-constrained parameters into one unconstrained parameter vector.
+
+    The pack is the unit of optimisation: it has one trainable leaf, one base dtype, and one transform from the real
+    line to the unit hypercube. Unit-space slices are reshaped and passed through each prior independently.
+    """
+
+    def __init__(self, priors: Sequence[AbstractPrior], name: str = 'packed'):
+        self._priors = tuple(priors)
+        self._name = name
+        if len(self._priors) == 0:
+            raise ValueError("ParameterPack requires at least one prior.")
+        if not isinstance(name, str) or name == '':
+            raise ValueError("ParameterPack name must be a non-empty string.")
+        for prior in self._priors:
+            if not isinstance(prior, AbstractPrior):
+                raise TypeError(f"Expected an AbstractPrior, got {type(prior)}.")
+            _validate_parameter_prior(prior)
+
+        names = tuple(prior.name for prior in self._priors)
+        if len(names) != len(set(names)):
+            raise ValueError(f"ParameterPack prior names must be unique, got {names}.")
+
+        self._base_dtype = self._priors[0].base_dtype
+        for prior in self._priors[1:]:
+            if prior.base_dtype != self._base_dtype:
+                raise ValueError(
+                    f"All priors in ParameterPack {name} must have base dtype {self._base_dtype}, "
+                    f"got {prior.base_dtype} for {prior.name}."
+                )
+
+        offsets = [0]
+        for prior in self._priors:
+            offsets.append(offsets[-1] + prior.base_ndims)
+        self._offsets = tuple(offsets)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def priors(self) -> Tuple[AbstractPrior, ...]:
+        return self._priors
+
+    @property
+    def base_dtype(self):
+        return self._base_dtype
+
+    @property
+    def base_ndims(self) -> int:
+        return self._offsets[-1]
+
+    def parameter(self, *, init: Optional[Sequence[FloatArray | Callable | None]] = None,
+                  random_init: bool = False, param_collection: str = 'params', U_collection: str = 'U',
+                  X_collection: str = 'X', log_prob_collection: str = 'log_prob',
+                  rng_stream: str = 'params') -> Tuple[CoDomain, ...]:
+        """
+        Create physical parameters backed by one packed unconstrained parameter.
+
+        Args:
+            init: optional sequence of initial values or callables in X-space, one per prior.
+            random_init: whether members without an explicit initial value start from a standard normal draw.
+            param_collection: collection containing the single packed trainable parameter.
+            U_collection: collection containing the packed unit-hypercube value.
+            X_collection: collection containing physical values under their prior names.
+            log_prob_collection: collection containing per-prior log probabilities.
+            rng_stream: random stream used by random or callable initialisers.
+
+        Returns:
+            Tuple of physical values in the same order as ``priors``.
+        """
+        if init is None:
+            if random_init:
+                packed_initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
+            else:
+                packed_initialiser = jnp.zeros
+        else:
+            initial_values = tuple(init)
+            if len(initial_values) != len(self._priors):
+                raise ValueError(
+                    f"ParameterPack {self.name} expected {len(self._priors)} initial values, "
+                    f"got {len(initial_values)}."
+                )
+
+            initialisers = tuple(
+                _parameter_initialiser(prior, initial_value, random_init, rng_stream)
+                for prior, initial_value in zip(self._priors, initial_values)
+            )
+
+            def packed_initialiser(shape, dtype):
+                chunks = []
+                for prior, initialiser in zip(self._priors, initialisers):
+                    chunk = jnp.asarray(initialiser(prior.base_shape, prior.base_dtype), dtype=dtype)
+                    if chunk.shape != prior.base_shape:
+                        raise ValueError(
+                            f"Unconstrained initial value for {prior.name} has shape {chunk.shape}, "
+                            f"expected {prior.base_shape}."
+                        )
+                    chunks.append(jnp.reshape(chunk, (prior.base_ndims,)))
+                packed = chunks[0] if len(chunks) == 1 else jnp.concatenate(chunks)
+                if packed.shape != shape:
+                    raise ValueError(f"Packed initial value has shape {packed.shape}, expected {shape}.")
+                return packed
+
+        N_packed = get_parameter(
+            name=self.name,
+            shape=(self.base_ndims,),
+            dtype=self.base_dtype,
+            init=packed_initialiser,
+            collection=param_collection
+        )
+        U_packed = quick_unit(N_packed)
+        set_state(name=self.name, collection=U_collection, value=U_packed)
+
+        physical_values = []
+        for prior, start, stop in zip(self._priors, self._offsets[:-1], self._offsets[1:]):
+            U = jax.lax.slice_in_dim(U_packed, start, stop)
+            U = jax.lax.reshape(U, prior.base_shape)
+            X = prior.forward(U)
+            set_state(name=prior.name, collection=X_collection, value=X)
+            set_state(name=prior.name, collection=log_prob_collection, value=prior.log_prob(X))
+            physical_values.append(X)
+        return tuple(physical_values)
+
+
 def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None = None, random_init: bool = False,
                        param_collection: str = 'params',
                        U_collection: str = 'U', X_collection: str = 'X', log_prob_collection: str = 'log_prob',
@@ -389,36 +553,8 @@ def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None 
     Returns:
         A parameter representing the prior.
     """
-    if prior.name is None:
-        raise ValueError("Prior must have a name to be parametrised.")
-    if prior.base_ndims == 0:
-        warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
-    if init is not None:
-        # tranform: X -> U -> N
-        if callable(init):
-            @partial(wrap_random, rng_stream=rng_stream)
-            def initialiser(key, shape, dtype):
-                X = jnp.asarray(init(key, shape, dtype))
-                if X.shape != shape:
-                    raise ValueError(f"Initialiser callable for {prior.name} returned shape {np.shape(X)}, expected {shape}.")
-                if X.dtype != dtype:
-                    raise ValueError(f"Initialiser callable for {prior.name} returned dtype {X.dtype}, expected {dtype}.")
-                U = prior.inverse(X)
-                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
-                return N
-        else:
-            def initialiser(shape, dtype):
-                del shape, dtype
-                X = jnp.asarray(init)
-                U = prior.inverse(X)
-                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
-                return N
-    else:
-        if random_init:
-            initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
-        else:
-            # Initialises at median of distribution using zeros.
-            initialiser = jnp.zeros
+    _validate_parameter_prior(prior)
+    initialiser = _parameter_initialiser(prior, init, random_init, rng_stream)
     N_base_param = get_parameter(
         name=prior.name,
         shape=prior.base_shape,
@@ -427,24 +563,11 @@ def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None 
         collection=param_collection
     )
     # transform [-inf, inf] -> [0,1]
-    U_base_param = get_parameter(
-        name=prior.name,
-        shape=prior.base_shape,
-        dtype=prior.base_dtype,
-        init=quick_unit(N_base_param),
-        collection=U_collection
-    )
-    X_param = get_parameter(
-        name=prior.name,
-        collection=X_collection,
-        init=prior.forward(U_base_param)
-    )
-    # Register the log_prob as a parameter
-    _ = get_parameter(
-        name=prior.name,
-        collection=log_prob_collection,
-        init=prior.log_prob(X_param)
-    )
+    U_base_param = quick_unit(N_base_param)
+    set_state(name=prior.name, collection=U_collection, value=U_base_param)
+    X_param = prior.forward(U_base_param)
+    set_state(name=prior.name, collection=X_collection, value=X_param)
+    set_state(name=prior.name, collection=log_prob_collection, value=prior.log_prob(X_param))
     return X_param
 
 
@@ -479,15 +602,7 @@ def realise_prior(prior: AbstractPrior, U_collection: str = 'U', X_collection: s
         init=initaliser,
         collection=U_collection
     )
-    X_param = get_parameter(
-        name=prior.name,
-        collection=X_collection,
-        init=prior.forward(U_base_param)
-    )
-    # Register the log_prob as a parameter
-    _ = get_parameter(
-        name=prior.name,
-        collection=log_prob_collection,
-        init=prior.log_prob(X_param)
-    )
+    X_param = prior.forward(U_base_param)
+    set_state(name=prior.name, collection=X_collection, value=X_param)
+    set_state(name=prior.name, collection=log_prob_collection, value=prior.log_prob(X_param))
     return X_param
