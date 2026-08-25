@@ -1,9 +1,21 @@
+from dataclasses import FrozenInstanceError
+
 import jax
 import numpy as np
 import pytest
 from jax import numpy as jnp
 
-from jaxctx.context import get_parameter, wrap_random, set_parameter, transform, ScopedDict, scope
+from jaxctx.context import (
+    ApplyReturn,
+    InitReturn,
+    get_parameter,
+    wrap_random,
+    set_parameter,
+    transform,
+    ScopedDict,
+    scope,
+)
+from jaxctx.pytree import PureDataclassPytree
 
 
 def test_transform():
@@ -36,6 +48,60 @@ def test_transform():
         print(next_response)
         assert next_response.fn_val == response.collections['state']['s'] + 1 + response.collections['params']['y']
         assert next_response.fn_val == next_response.collections['state']['s']
+
+
+def test_return_containers_preserve_fields_tuple_protocol_and_pytree_roundtrip():
+    collections = {'params': ScopedDict({'x': jnp.asarray(2.)})}
+    apply_return = ApplyReturn(fn_val=jnp.asarray(1.), collections=collections)
+    init_return = InitReturn(collections=collections)
+
+    assert isinstance(apply_return, PureDataclassPytree)
+    assert isinstance(init_return, PureDataclassPytree)
+    assert not hasattr(apply_return, '__dict__')
+    assert not hasattr(init_return, '__dict__')
+    with pytest.raises(FrozenInstanceError):
+        apply_return.fn_val = jnp.asarray(3.)
+    with pytest.raises(FrozenInstanceError):
+        init_return.collections = {}
+    assert apply_return.fn_val == 1.
+    assert apply_return.collections is collections
+    assert len(apply_return) == 2
+    assert apply_return[0] == apply_return.fn_val
+    assert apply_return[1] is collections
+    fn_val, unpacked_apply_collections = apply_return
+    assert fn_val == apply_return.fn_val
+    assert unpacked_apply_collections is collections
+
+    assert init_return.collections is collections
+    assert len(init_return) == 1
+    assert init_return[0] is collections
+    unpacked_init_collections, = init_return
+    assert unpacked_init_collections is collections
+
+    apply_leaves, apply_tree = jax.tree.flatten(apply_return)
+    rebuilt_apply = jax.tree.unflatten(apply_tree, apply_leaves)
+    assert isinstance(rebuilt_apply, ApplyReturn)
+    assert rebuilt_apply.fn_val == apply_return.fn_val
+    np.testing.assert_array_equal(
+        rebuilt_apply.collections['params']['x'],
+        apply_return.collections['params']['x']
+    )
+
+    init_leaves, init_tree = jax.tree.flatten(init_return)
+    rebuilt_init = jax.tree.unflatten(init_tree, init_leaves)
+    assert isinstance(rebuilt_init, InitReturn)
+    np.testing.assert_array_equal(
+        rebuilt_init.collections['params']['x'],
+        init_return.collections['params']['x']
+    )
+
+
+def test_transformed_fn_is_slotted_and_frozen():
+    transformed = transform(lambda: None)
+
+    assert not hasattr(transformed, '__dict__')
+    with pytest.raises(FrozenInstanceError):
+        transformed.base_dtype = jnp.float16
 
 
 def test_scoped_dict_nested_and_dotted():

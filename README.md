@@ -16,6 +16,7 @@ the individual priors.
 import jax.numpy as jnp
 import tensorflow_probability.substrates.jax as tfp
 
+from jaxctx import transform
 from jaxctx.priors import ParameterPack, Prior
 
 tfpd = tfp.distributions
@@ -32,18 +33,26 @@ parameters = ParameterPack(
 def model():
     location, weights = parameters.parameter()
     return location, weights
+
+
+transformed_model = transform(model, base_dtype=jnp.float32)
 ```
 
 The trainable collection contains only `params["model"]`, with shape `(3,)`. The derived unit collection contains
 `U["model"]`, while physical values and log probabilities remain available under their prior names. The pack is the
 unit of optimisation and freezing; use separate packs when separate optimiser treatment is required.
 
+`base_dtype` is configured once on `transform` and is shared by every unconstrained N value and unit-hypercube U value
+in that transformed model, whether packed or created through `Prior.parameter()`. Priors remain responsible for their
+physical X dtype, so a forward transform may produce floating, integer, boolean, or complex values independently of the
+N/U dtype. Prior constructors therefore do not take `base_dtype`.
+
 Packed parameterisation is intended for new models. Its checkpoint layout follows the declared prior order, so keep
 the order and base dimensions stable when restoring a packed model. Existing models using `Prior.parameter()` remain
 supported.
 
 Physical initial values can be supplied in prior order. Entries may use the same constant or callable forms supported
-by `Prior.parameter()`:
+by `Prior.parameter()`; callables receive the physical X shape and dtype of their prior:
 
 ```python
 location, weights = parameters.parameter(

@@ -10,7 +10,7 @@ from jaxctx.priors.prior import AbstractPrior, quick_unit, quick_unit_inverse, P
 
 class SpyPrior(AbstractPrior):
     def __init__(self, state, name="p"):
-        super().__init__(name=name, base_dtype=jnp.float32)
+        super().__init__(name=name)
         self._state = state
 
     def _dtype(self):
@@ -77,29 +77,25 @@ def test_prior_base_dtype_works_in_current_jax_mode(base_dtype):
             loc=jnp.asarray(0., dtype=jnp.float32),
             scale=jnp.asarray(1., dtype=jnp.float32)
         ),
-        name='x',
-        base_dtype=base_dtype
+        name='x'
     )
     realised_prior = Prior(
         tfpd.Normal(
             loc=jnp.asarray(0., dtype=jnp.float32),
             scale=jnp.asarray(1., dtype=jnp.float32)
         ),
-        name='y',
-        base_dtype=base_dtype
+        name='y'
     )
-
-    assert parameter_prior.base_dtype == effective_dtype
-    assert realised_prior.base_dtype == effective_dtype
 
     def model():
         x = parameter_prior.parameter(random_init=True)
         y = realised_prior.realise()
         return x, y
 
-    tf = transform(model)
+    tf = transform(model, base_dtype=base_dtype)
     init_res = tf.init({'params': jax.random.PRNGKey(0), 'U': jax.random.PRNGKey(1)}, {})
 
+    assert tf.base_dtype == effective_dtype
     assert init_res.collections['params']['x'].dtype == effective_dtype
     assert init_res.collections['U']['x'].dtype == effective_dtype
     assert init_res.collections['U']['y'].dtype == effective_dtype
