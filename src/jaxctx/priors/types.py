@@ -1,49 +1,47 @@
-from typing import Union
+from typing import TypeAlias, Union
 
 import jax
 import numpy as np
 
 __all__ = [
     'PRNGKey',
+    'Array',
+    'ComplexArray',
     'IntArray',
     'FloatArray',
     'BoolArray'
 ]
 
-PRNGKey = jax.Array
+#: JAX pseudo-random number generator key.
+PRNGKey: TypeAlias = jax.Array
 
-Array = Union[
+#: JAX or NumPy array, without scalar values.
+Array: TypeAlias = Union[
     jax.Array,  # JAX array type
     np.ndarray,  # NumPy array type
 ]
-ComplexArray = Union[
+#: JAX or NumPy array, with complex scalar values.
+ComplexArray: TypeAlias = Union[
     jax.Array,  # JAX array type
     np.ndarray,  # NumPy array type
     complex,  # valid scalars
 ]
 
-FloatArray = Union[
+#: JAX or NumPy array, with floating scalar values.
+FloatArray: TypeAlias = Union[
     jax.Array,  # JAX array type
     np.ndarray,  # NumPy array type
     float,  # valid scalars
 ]
-IntArray = Union[
+#: JAX or NumPy array, with integer scalar values.
+IntArray: TypeAlias = Union[
     jax.Array,  # JAX array type
     np.ndarray,  # NumPy array type
     int,  # valid scalars
 ]
-BoolArray = Union[
+#: JAX or NumPy array, with boolean scalar values.
+BoolArray: TypeAlias = Union[
     jax.Array,  # JAX array type
     np.ndarray,  # NumPy array type
     np.bool_, bool,  # valid scalars
 ]
-
-Array.__doc__ = "Type annotation for JAX array-like objects, with no scalar types."
-
-ComplexArray.__doc__ = "Type annotation for JAX array-like objects, with complex scalar types."
-
-FloatArray.__doc__ = "Type annotation for JAX array-like objects, with float scalar types."
-
-IntArray.__doc__ = "Type annotation for JAX array-like objects, with int scalar types."
-
-BoolArray.__doc__ = "Type annotation for JAX array-like objects, with bool scalar types."

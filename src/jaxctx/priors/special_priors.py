@@ -32,8 +32,8 @@ measure_dtype = jnp.float64
 
 
 class Bernoulli(AbstractPrior):
-    def __init__(self, *, logits=None, probs=None, name: Optional[str] = None, base_dtype=jnp.float32):
-        super(Bernoulli, self).__init__(name=name, base_dtype=base_dtype)
+    def __init__(self, *, logits=None, probs=None, name: Optional[str] = None):
+        super(Bernoulli, self).__init__(name=name)
         self.dist = tfpd.Bernoulli(logits=logits, probs=probs)
 
     def _dtype(self):
@@ -62,8 +62,8 @@ class Bernoulli(AbstractPrior):
 
 
 class Beta(AbstractPrior):
-    def __init__(self, *, concentration0=None, concentration1=None, name: Optional[str] = None, base_dtype=jnp.float32):
-        super(Beta, self).__init__(name=name, base_dtype=base_dtype)
+    def __init__(self, *, concentration0=None, concentration1=None, name: Optional[str] = None):
+        super(Beta, self).__init__(name=name)
         # Special cases for Beta that are faster use the Kumaraswamy distribution
         if isinstance(concentration0, (float, int)) and concentration0 == 1:
             self.dist = tfpd.Kumaraswamy(concentration0=concentration0, concentration1=concentration1)
@@ -102,7 +102,7 @@ class Beta(AbstractPrior):
 
 class Categorical(AbstractPrior):
     def __init__(self, parametrisation: Literal['gumbel_max', 'cdf'], *, logits=None, probs=None,
-                 name: Optional[str] = None, base_dtype=jnp.float32):
+                 name: Optional[str] = None):
         """
         Initialised Categorical special prior.
 
@@ -113,7 +113,7 @@ class Categorical(AbstractPrior):
             probs: prob of each category
             name: optional name
         """
-        super(Categorical, self).__init__(name=name, base_dtype=base_dtype)
+        super(Categorical, self).__init__(name=name)
         self.dist = tfpd.Categorical(logits=logits, probs=probs)
         self._parametrisation = parametrisation
 
@@ -193,8 +193,8 @@ class ForcedIdentifiability(AbstractPrior):
     """
 
     def __init__(self, *, n: int, low=None, high=None, fix_left: bool = False, fix_right: bool = False,
-                 name: Optional[str] = None, base_dtype=jnp.float32):
-        super(ForcedIdentifiability, self).__init__(name=name, base_dtype=base_dtype)
+                 name: Optional[str] = None):
+        super(ForcedIdentifiability, self).__init__(name=name)
         n_min = (1 if fix_left else 0) + (1 if fix_right else 0)
         if n < n_min:
             raise ValueError(f'`n` too small for fix_left={fix_left} and fix_right={fix_right}')
@@ -349,8 +349,8 @@ def _poisson_quantile(U, rate, unroll: bool = False):
 
 
 class Poisson(AbstractPrior):
-    def __init__(self, *, rate=None, log_rate=None, name: Optional[str] = None, base_dtype=jnp.float32):
-        super(Poisson, self).__init__(name=name, base_dtype=base_dtype)
+    def __init__(self, *, rate=None, log_rate=None, name: Optional[str] = None):
+        super(Poisson, self).__init__(name=name)
         self.dist = tfpd.Poisson(rate=rate, log_rate=log_rate)
 
     def _dtype(self):
@@ -402,8 +402,8 @@ class UnnormalisedDirichlet(AbstractPrior):
     Y = X / sum(X) ==> Y ~ Dirichlet(alpha)
     """
 
-    def __init__(self, *, concentration, name: Optional[str] = None, base_dtype=jnp.float32):
-        super(UnnormalisedDirichlet, self).__init__(name=name, base_dtype=base_dtype)
+    def __init__(self, *, concentration, name: Optional[str] = None):
+        super(UnnormalisedDirichlet, self).__init__(name=name)
         self._dirichlet_dist = tfpd.Dirichlet(concentration=concentration)
         self._gamma_dist = tfpd.Gamma(concentration=concentration, log_rate=0.)
 
@@ -437,9 +437,8 @@ class Empirical(AbstractPrior):
     """
 
     def __init__(self, *, samples: jax.Array, support_min: Optional[FloatArray] = None,
-                 support_max: Optional[FloatArray] = None, resolution: int = 100, name: Optional[str] = None,
-                 base_dtype=jnp.float32):
-        super(Empirical, self).__init__(name=name, base_dtype=base_dtype)
+                 support_max: Optional[FloatArray] = None, resolution: int = 100, name: Optional[str] = None):
+        super(Empirical, self).__init__(name=name)
         if len(np.shape(samples)) < 1:
             raise ValueError("Samples must have at least one dimension")
         if np.size(samples) == 0:
@@ -518,8 +517,8 @@ class TruncationWrapper(AbstractPrior):
     """
 
     def __init__(self, prior: AbstractPrior, low: Union[jax.Array, float], high: Union[jax.Array, float],
-                 name: Optional[str] = None, base_dtype=jnp.float32):
-        super(TruncationWrapper, self).__init__(name=name, base_dtype=base_dtype)
+                 name: Optional[str] = None):
+        super(TruncationWrapper, self).__init__(name=name)
         self.prior = prior
         self.low = jnp.minimum(low, high)
         self.high = jnp.maximum(low, high)
@@ -551,8 +550,8 @@ class TruncationWrapper(AbstractPrior):
 
 class ExplicitDensityPrior(AbstractPrior):
     def __init__(self, *, axes: Tuple[jax.Array, ...], density: jax.Array, regular_grid: bool = False,
-                 name: Optional[str] = None, base_dtype=jnp.float32):
-        super(ExplicitDensityPrior, self).__init__(name=name, base_dtype=base_dtype)
+                 name: Optional[str] = None):
+        super(ExplicitDensityPrior, self).__init__(name=name)
         self._num_dims = num_dims = len(np.shape(density))
         for i in range(num_dims):
             if len(np.shape(axes[i])) != 1:
@@ -788,5 +787,3 @@ class InterpolatedArray:
         """
         (i0, alpha0), (i1, alpha1) = get_interp_indices_and_weights(t, self.x, regular_grid=self.regular_grid)
         return jax.tree.map(lambda x: apply_interp(x, i0, alpha0, i1, alpha1, axis=self.axis), self.values)
-
-

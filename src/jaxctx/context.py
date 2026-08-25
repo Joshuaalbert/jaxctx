@@ -2,12 +2,14 @@ import dataclasses
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import wraps
-from typing import Any, Callable, Tuple, NamedTuple, Optional, TypeVar, List, Dict, Generic, Union, Iterator
+from typing import Any, Callable, Tuple, Optional, TypeVar, List, Dict, Generic, Union, Iterator
 
 import jax
+from jax import numpy as jnp
 from jax._src.typing import SupportsDType
 
 from jaxctx.priors.types import PRNGKey
+from jaxctx.pytree import PureDataclassPytree
 
 __all__ = [
     'get_parameter',
@@ -16,6 +18,7 @@ __all__ = [
     'convert_external_params',
     'wrap_random',
     'next_rng_key',
+    'get_base_dtype',
     'scope',
     'CtxParams',
     'ScopedDict'
@@ -204,6 +207,7 @@ def _unflatten_mapping(structure: Tuple[Tuple[str, Any], ...], children_iter: It
             mapping[key] = _unflatten_mapping(sub_structure, children_iter)
     return mapping
 
+
 def scoped_dict_flatten(scoped_dict: ScopedDict):
     children, structure = _flatten_mapping(scoped_dict._dict)
     return (
@@ -229,7 +233,8 @@ CtxParams = ScopedDict
 
 
 class Ctx:
-    def __init__(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict], stack: List['Ctx'], init: bool):
+    def __init__(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict], stack: List['Ctx'], init: bool,
+                 base_dtype):
         self._collections = defaultdict(ScopedDict)
         for key, val in collections.items():
             self._collections[key] = val
@@ -237,6 +242,7 @@ class Ctx:
         self._stack = stack
         self._scopes = []
         self._init = init
+        self._base_dtype = base_dtype
 
     def next_rng_key(self, rng_stream: str) -> PRNGKey:
         if rng_stream not in self._rngs:
@@ -259,6 +265,10 @@ class Ctx:
     def collections(self) -> Dict[str, ScopedDict]:
         return dict(self._collections.items())
 
+    @property
+    def base_dtype(self):
+        return self._base_dtype
+
     def get_collection(self, collection: str) -> ScopedDict:
         return self._collections[collection].with_scopes(self._scopes)
 
@@ -273,8 +283,8 @@ class GlobalContext:
     def __init__(self, rng: Optional[jax.Array] = None):
         self.stack: List[Ctx] = []
 
-    def new(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict], init: bool):
-        new_ctx = Ctx(rngs=rngs, collections=collections, stack=self.stack, init=init)
+    def new(self, rngs: Dict[str, PRNGKey], collections: Dict[str, ScopedDict], init: bool, base_dtype):
+        new_ctx = Ctx(rngs=rngs, collections=collections, stack=self.stack, init=init, base_dtype=base_dtype)
         self.stack.append(new_ctx)
         return new_ctx
 
@@ -283,6 +293,12 @@ class GlobalContext:
         if len(self.stack) == 0:
             raise ValueError("No context available. Must use `transform` to create a context.")
         return self.stack[-1].collections
+
+    @property
+    def base_dtype(self):
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use `transform` to create a context.")
+        return self.stack[-1].base_dtype
 
     @property
     def is_init(self) -> bool:
@@ -488,19 +504,44 @@ def wrap_random(f, rng_stream: str, **kwargs):
 FV = TypeVar('FV')
 
 
-class ApplyReturn(NamedTuple, Generic[FV]):
+@dataclasses.dataclass(slots=True, frozen=True)
+class ApplyReturn(PureDataclassPytree, Generic[FV]):
     fn_val: FV
     collections: Dict[str, ScopedDict]
 
+    def __iter__(self):
+        return iter((self.fn_val, self.collections))
 
-class InitReturn(NamedTuple, Generic[FV]):
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, item):
+        return (self.fn_val, self.collections)[item]
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class InitReturn(PureDataclassPytree, Generic[FV]):
     collections: Dict[str, ScopedDict]
 
+    def __iter__(self):
+        return iter((self.collections,))
 
-@dataclasses.dataclass
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, item):
+        return (self.collections,)[item]
+
+
+ApplyReturn.register_pytree()
+InitReturn.register_pytree()
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
 class TransformedFn(Generic[FV]):
     _apply_fn: Callable
     _init_fn: Callable
+    base_dtype: Any
 
     def apply(self, rngs, collections, *args, **kwargs) -> ApplyReturn[FV]:
         """
@@ -533,16 +574,20 @@ class TransformedFn(Generic[FV]):
         return self._init_fn(rngs, collections, *args, **kwargs)
 
 
-def transform(f: Callable[..., FV]) -> TransformedFn[FV]:
+def transform(f: Callable[..., FV], *, base_dtype=jnp.float32) -> TransformedFn[FV]:
     """
     Transform a function that uses parameters and states into a pure function.
 
     Args:
         f: the function to transform
+        base_dtype: shared dtype for every unconstrained N value and unit-hypercube U value in the transformed model.
 
     Returns:
-        A tuple of the init and apply functions
+        The transformed init/apply functions and their shared base dtype.
     """
+    base_dtype = jax.dtypes.canonicalize_dtype(base_dtype)
+    if not jnp.issubdtype(base_dtype, jnp.floating):
+        raise TypeError(f"base_dtype must be a floating dtype, got {base_dtype}.")
 
     def apply_fn(rngs, collections, *args, **kwargs) -> ApplyReturn[FV]:
         """
@@ -558,7 +603,7 @@ def transform(f: Callable[..., FV]) -> TransformedFn[FV]:
         if collections is None:
             collections = {}
 
-        with global_context.new(rngs=rngs, collections=collections, init=False) as ctx:
+        with global_context.new(rngs=rngs, collections=collections, init=False, base_dtype=base_dtype):
             fn_val = f(*args, **kwargs)
             return ApplyReturn(fn_val=fn_val, collections=global_context.collections)
 
@@ -576,13 +621,13 @@ def transform(f: Callable[..., FV]) -> TransformedFn[FV]:
         if collections is None:
             collections = {}
 
-        with global_context.new(rngs=rngs, collections=collections, init=True) as ctx:
+        with global_context.new(rngs=rngs, collections=collections, init=True, base_dtype=base_dtype):
             # can be sped up with aeval
             _ = f(*args, **kwargs)
             del _  # Ensure no closure issues
             return InitReturn(collections=global_context.collections)
 
-    return TransformedFn(_init_fn=init_fn, _apply_fn=apply_fn)
+    return TransformedFn(_init_fn=init_fn, _apply_fn=apply_fn, base_dtype=base_dtype)
 
 
 def next_rng_key(rng_stream: str):
@@ -593,3 +638,8 @@ def next_rng_key(rng_stream: str):
         The next random number generator
     """
     return global_context.next_rng_key(rng_stream)
+
+
+def get_base_dtype():
+    """Return the shared N-space and U-space dtype for the active transformed model."""
+    return global_context.base_dtype

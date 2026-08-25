@@ -221,13 +221,13 @@ def test_special_priors(mock_special_priors):
     for prior, (vmin, vmax), shape in mock_special_priors:
         print(f"Testing {prior.__class__}")
 
-        x = prior.forward(jnp.ones(prior.base_shape, prior.base_dtype))
+        x = prior.forward(jnp.ones(prior.base_shape, jnp.float32))
         assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
         assert jnp.all(x >= vmin)
         assert jnp.all(x <= vmax)
         assert x.shape == shape
         assert x.shape == prior.shape
-        x = prior.forward(jnp.zeros(prior.base_shape, prior.base_dtype))
+        x = prior.forward(jnp.zeros(prior.base_shape, jnp.float32))
         assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
         assert jnp.all(x >= vmin)
         assert jnp.all(x <= vmax)
@@ -252,13 +252,12 @@ def test_special_priors(mock_special_priors):
 
 
 @pytest.mark.parametrize("rate, error", (
-        [2.0, 1.],
-        [10., 1.],
-        [100., 1.],
-        [1000., 1.],
-        [10000., 1.]
-)
-                         )
+    [2.0, 1.],
+    [10., 1.],
+    [100., 1.],
+    [1000., 1.],
+    [10000., 1.]
+))
 def test_poisson_quantile_bisection(rate, error):
     U = jnp.linspace(0., 1. - np.spacing(1.), 1000)
     x, x_results = _poisson_quantile_bisection(U, rate, unroll=False)
@@ -334,17 +333,17 @@ def test_empirical():
     prior = Empirical(samples=samples, resolution=100, name='x')
     assert prior._percentiles.shape == (101, 1)
 
-    x = prior.forward(jnp.ones(prior.base_shape, prior.base_dtype))
+    x = prior.forward(jnp.ones(prior.base_shape, jnp.float32))
     assert x.shape == ()
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
-    x = prior.forward(jnp.zeros(prior.base_shape, prior.base_dtype))
+    x = prior.forward(jnp.zeros(prior.base_shape, jnp.float32))
     assert x.shape == ()
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
 
-    x = prior.forward(0.5 * jnp.ones(prior.base_shape, prior.base_dtype))
+    x = prior.forward(0.5 * jnp.ones(prior.base_shape, jnp.float32))
     np.testing.assert_allclose(x, 0., atol=0.06)
 
-    u_input = vmap(lambda key: jax.random.uniform(key, shape=prior.base_shape, dtype=prior.base_dtype))(
+    u_input = vmap(lambda key: jax.random.uniform(key, shape=prior.base_shape, dtype=jnp.float32))(
         jax.random.split(jax.random.PRNGKey(42), 1000))
     x = vmap(lambda u: prior.forward(u))(u_input)
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
@@ -359,13 +358,13 @@ def test_truncation_wrapper():
     prior = Prior(tfpd.Normal(loc=jnp.zeros(5), scale=jnp.ones(5)))
     trancated_prior = TruncationWrapper(prior=prior, low=0., high=1.)
 
-    x = trancated_prior.forward(jnp.ones(trancated_prior.base_shape, prior.base_dtype))
+    x = trancated_prior.forward(jnp.ones(trancated_prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x >= 0.)
     assert jnp.all(x <= 1.)
     assert x.shape == (5,)
 
-    x = trancated_prior.forward(jnp.zeros(trancated_prior.base_shape, prior.base_dtype))
+    x = trancated_prior.forward(jnp.zeros(trancated_prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x >= 0.)
     assert jnp.all(x <= 1.)
@@ -384,13 +383,13 @@ def test_truncation_wrapper():
     prior = Prior(tfpd.Normal(loc=jnp.zeros(5), scale=jnp.ones(5)))
     trancated_prior = TruncationWrapper(prior=prior, low=-jnp.inf, high=1.)
 
-    x = trancated_prior.forward(jnp.ones(trancated_prior.base_shape, prior.base_dtype))
+    x = trancated_prior.forward(jnp.ones(trancated_prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x >= -jnp.inf)
     assert jnp.all(x <= 1.)
     assert x.shape == (5,)
 
-    x = trancated_prior.forward(jnp.zeros(trancated_prior.base_shape, prior.base_dtype))
+    x = trancated_prior.forward(jnp.zeros(trancated_prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x >= -jnp.inf)
     assert jnp.all(x <= 1.)
@@ -409,13 +408,13 @@ def test_truncation_wrapper():
     prior = Prior(tfpd.Normal(loc=jnp.zeros(5), scale=0.01 * jnp.ones(5)))
     trancated_prior = TruncationWrapper(prior=prior, low=0., high=1.)
 
-    x = trancated_prior.forward(jnp.ones(trancated_prior.base_shape, prior.base_dtype))
+    x = trancated_prior.forward(jnp.ones(trancated_prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x >= 0.)
     assert jnp.all(x <= 1.)
     assert x.shape == (5,)
 
-    x = trancated_prior.forward(jnp.zeros(trancated_prior.base_shape, prior.base_dtype))
+    x = trancated_prior.forward(jnp.zeros(trancated_prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x >= 0.)
     assert jnp.all(x <= 1.)
@@ -438,12 +437,12 @@ def test_explicit_density_prior():
     axes = (jnp.linspace(0, 1, resolution + 1), jnp.linspace(0, 1, resolution))
     prior = ExplicitDensityPrior(axes=axes, density=density, regular_grid=True)
 
-    x = prior.forward(jnp.ones(prior.base_shape, prior.base_dtype))
+    x = prior.forward(jnp.ones(prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x == 1.)
     assert x.shape == (2,)
 
-    x = prior.forward(jnp.zeros(prior.base_shape, prior.base_dtype))
+    x = prior.forward(jnp.zeros(prior.base_shape, jnp.float32))
     assert jnp.all(jnp.bitwise_not(jnp.isnan(x)))
     assert jnp.all(x == 0.)
     assert x.shape == (2,)

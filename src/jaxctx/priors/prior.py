@@ -1,7 +1,7 @@
 import warnings
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Tuple, Optional, Union, List, Callable
+from typing import Tuple, Optional, Union, List, Callable, Sequence
 
 import jax
 import numpy as np
@@ -9,6 +9,7 @@ import tensorflow_probability.substrates.jax as tfp
 from jax import numpy as jnp
 
 from jaxctx import wrap_random, get_parameter
+from jaxctx.context import get_base_dtype, set_state
 from jaxctx.priors.types import FloatArray, IntArray, BoolArray, ComplexArray
 
 tfpd = tfp.distributions
@@ -23,9 +24,8 @@ class AbstractPrior(ABC):
     Represents a generative prior.
     """
 
-    def __init__(self, name: str | None, base_dtype):
+    def __init__(self, name: str | None):
         self._name = name
-        self._base_dtype = jax.dtypes.canonicalize_dtype(base_dtype)
 
     def __repr__(self):
         return f"{self.name if self.name is not None else '*'}\t{self.base_shape} -> {self.shape} {self.dtype}"
@@ -106,13 +106,6 @@ class AbstractPrior(ABC):
         return self._dtype()
 
     @property
-    def base_dtype(self):
-        """
-        The dtype of the prior random variable in X-space.
-        """
-        return self._base_dtype
-
-    @property
     def base_shape(self) -> Tuple[int, ...]:
         """
         The base shape of the prior random variable in U-space.
@@ -189,6 +182,8 @@ class AbstractPrior(ABC):
             param_collection: The collection to register the parameter in.
             rng_stream: The name of the random number generator stream to use for sampling.
 
+        The active ``transform`` supplies the shared dtype for the unconstrained N value and derived U value.
+
         Returns:
             a parameter constrained to the prior distribution.
         """
@@ -220,8 +215,8 @@ class Prior(AbstractPrior):
     Represents a generative prior.
     """
 
-    def __init__(self, dist: tfpd.Distribution, name: Optional[str] = None, base_dtype=jnp.float32):
-        AbstractPrior.__init__(self, name=name, base_dtype=base_dtype)
+    def __init__(self, dist: tfpd.Distribution, name: Optional[str] = None):
+        AbstractPrior.__init__(self, name=name)
         self._dist_chain = TFPDistributionChain(dist)
         self._dist = dist
 
@@ -367,6 +362,227 @@ def sample_quick_unit_dist(key, shape, dtype):
     return jax.random.normal(key, shape, dtype)
 
 
+def _validate_parameter_prior(prior: AbstractPrior):
+    if prior.name is None:
+        raise ValueError("Prior must have a name to be parametrised.")
+    if prior.base_ndims == 0:
+        warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
+
+
+def _validate_shape_dtype(*, actual_shape, actual_dtype, shape: Tuple[int, ...], dtype, label: str):
+    expected_shape = tuple(shape)
+    if tuple(actual_shape) != expected_shape:
+        raise ValueError(f"{label} has shape {actual_shape}, expected {expected_shape}.")
+    expected_dtype = jax.dtypes.canonicalize_dtype(dtype)
+    actual_dtype = jax.dtypes.canonicalize_dtype(actual_dtype)
+    if actual_dtype != expected_dtype:
+        raise ValueError(f"{label} has dtype {actual_dtype}, expected {expected_dtype}.")
+
+
+def _validate_array_contract(value, *, shape: Tuple[int, ...], dtype, label: str):
+    _validate_shape_dtype(
+        actual_shape=value.shape,
+        actual_dtype=value.dtype,
+        shape=shape,
+        dtype=dtype,
+        label=label
+    )
+
+
+def _physical_to_unconstrained(prior: AbstractPrior, value, base_dtype, *, cast_physical_dtype: bool = False):
+    X = jnp.asarray(value, dtype=prior.dtype if cast_physical_dtype else None)
+    _validate_array_contract(
+        X,
+        shape=prior.shape,
+        dtype=prior.dtype,
+        label=f"Physical initial value for {prior.name}"
+    )
+    U = jnp.asarray(prior.inverse(X), dtype=base_dtype)
+    _validate_array_contract(
+        U,
+        shape=prior.base_shape,
+        dtype=base_dtype,
+        label=f"Unit initial value for {prior.name}"
+    )
+    N = jnp.asarray(quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6)), dtype=base_dtype)
+    _validate_array_contract(
+        N,
+        shape=prior.base_shape,
+        dtype=base_dtype,
+        label=f"Unconstrained initial value for {prior.name}"
+    )
+    return N
+
+
+def _parameter_initialiser(prior: AbstractPrior, init: FloatArray | Callable | None, random_init: bool,
+                           rng_stream: str, base_dtype):
+    if init is not None:
+        # transform: X -> U -> N
+        if callable(init):
+            @partial(wrap_random, rng_stream=rng_stream)
+            def initialiser(key, shape, dtype):
+                _validate_shape_dtype(
+                    actual_shape=shape,
+                    actual_dtype=dtype,
+                    shape=prior.base_shape,
+                    dtype=base_dtype,
+                    label=f"Requested unconstrained initial value for {prior.name}"
+                )
+                physical_dtype = jax.dtypes.canonicalize_dtype(prior.dtype)
+                X = init(key, prior.shape, physical_dtype)
+                return _physical_to_unconstrained(prior, X, base_dtype)
+        else:
+            def initialiser(shape, dtype):
+                _validate_shape_dtype(
+                    actual_shape=shape,
+                    actual_dtype=dtype,
+                    shape=prior.base_shape,
+                    dtype=base_dtype,
+                    label=f"Requested unconstrained initial value for {prior.name}"
+                )
+                return _physical_to_unconstrained(prior, init, base_dtype, cast_physical_dtype=True)
+    elif random_init:
+        initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
+    else:
+        # Initialises at median of distribution using zeros.
+        initialiser = jnp.zeros
+    return initialiser
+
+
+class ParameterPack:
+    """
+    Packs several prior-constrained parameters into one unconstrained parameter vector.
+
+    The pack is the unit of optimisation: it has one trainable leaf and one transform from the real line to the unit
+    hypercube. The active ``transform`` supplies the shared N/U dtype for packed and independent parameters alike.
+    Unit-space slices are reshaped and passed through each prior independently.
+    """
+
+    def __init__(self, priors: Sequence[AbstractPrior], name: str = 'packed'):
+        self._priors = tuple(priors)
+        self._name = name
+        if len(self._priors) == 0:
+            raise ValueError("ParameterPack requires at least one prior.")
+        if not isinstance(name, str) or name == '':
+            raise ValueError("ParameterPack name must be a non-empty string.")
+        for prior in self._priors:
+            if not isinstance(prior, AbstractPrior):
+                raise TypeError(f"Expected an AbstractPrior, got {type(prior)}.")
+            _validate_parameter_prior(prior)
+
+        names = tuple(prior.name for prior in self._priors)
+        if len(names) != len(set(names)):
+            raise ValueError(f"ParameterPack prior names must be unique, got {names}.")
+
+        offsets = [0]
+        for prior in self._priors:
+            offsets.append(offsets[-1] + prior.base_ndims)
+        self._offsets = tuple(offsets)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def priors(self) -> Tuple[AbstractPrior, ...]:
+        return self._priors
+
+    @property
+    def base_ndims(self) -> int:
+        return self._offsets[-1]
+
+    def parameter(self, *, init: Optional[Sequence[FloatArray | Callable | None]] = None,
+                  random_init: bool = False, param_collection: str = 'params', U_collection: str = 'U',
+                  X_collection: str = 'X', log_prob_collection: str = 'log_prob',
+                  rng_stream: str = 'params') -> Tuple[CoDomain, ...]:
+        """
+        Create physical parameters backed by one packed unconstrained parameter.
+
+        Args:
+            init: optional sequence of physical values or callables in X-space, one per prior. A callable receives the
+                physical shape and dtype of its prior.
+            random_init: whether members without an explicit initial value start from a standard normal draw.
+            param_collection: collection containing the single packed trainable parameter.
+            U_collection: collection containing the packed unit-hypercube value.
+            X_collection: collection containing physical values under their prior names.
+            log_prob_collection: collection containing per-prior log probabilities.
+            rng_stream: random stream used by random or callable initialisers.
+
+        Returns:
+            Tuple of physical values in the same order as ``priors``.
+        """
+        base_dtype = get_base_dtype()
+        if init is None:
+            if random_init:
+                packed_initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
+            else:
+                packed_initialiser = jnp.zeros
+        else:
+            initial_values = tuple(init)
+            if len(initial_values) != len(self._priors):
+                raise ValueError(
+                    f"ParameterPack {self.name} expected {len(self._priors)} initial values, "
+                    f"got {len(initial_values)}."
+                )
+
+            initialisers = tuple(
+                _parameter_initialiser(prior, initial_value, random_init, rng_stream, base_dtype)
+                for prior, initial_value in zip(self._priors, initial_values)
+            )
+
+            def packed_initialiser(shape, dtype):
+                chunks = []
+                for prior, initialiser in zip(self._priors, initialisers):
+                    chunk = initialiser(prior.base_shape, base_dtype)
+                    _validate_array_contract(
+                        chunk,
+                        shape=prior.base_shape,
+                        dtype=base_dtype,
+                        label=f"Unconstrained initial value for {prior.name}"
+                    )
+                    chunks.append(jnp.reshape(chunk, (prior.base_ndims,)))
+                packed = chunks[0] if len(chunks) == 1 else jnp.concatenate(chunks)
+                _validate_array_contract(
+                    packed,
+                    shape=shape,
+                    dtype=dtype,
+                    label=f"Packed initial value for {self.name}"
+                )
+                return packed
+
+        N_packed = get_parameter(
+            name=self.name,
+            shape=(self.base_ndims,),
+            dtype=base_dtype,
+            init=packed_initialiser,
+            collection=param_collection
+        )
+        _validate_array_contract(
+            N_packed,
+            shape=(self.base_ndims,),
+            dtype=base_dtype,
+            label=f"Packed parameter {self.name}"
+        )
+        U_packed = quick_unit(N_packed)
+        _validate_array_contract(
+            U_packed,
+            shape=(self.base_ndims,),
+            dtype=base_dtype,
+            label=f"Packed unit value {self.name}"
+        )
+        set_state(name=self.name, collection=U_collection, value=U_packed)
+
+        physical_values = []
+        for prior, start, stop in zip(self._priors, self._offsets[:-1], self._offsets[1:]):
+            U = jax.lax.slice_in_dim(U_packed, start, stop)
+            U = jax.lax.reshape(U, prior.base_shape)
+            X = prior.forward(U)
+            set_state(name=prior.name, collection=X_collection, value=X)
+            set_state(name=prior.name, collection=log_prob_collection, value=prior.log_prob(X))
+            physical_values.append(X)
+        return tuple(physical_values)
+
+
 def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None = None, random_init: bool = False,
                        param_collection: str = 'params',
                        U_collection: str = 'U', X_collection: str = 'X', log_prob_collection: str = 'log_prob',
@@ -389,62 +605,34 @@ def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None 
     Returns:
         A parameter representing the prior.
     """
-    if prior.name is None:
-        raise ValueError("Prior must have a name to be parametrised.")
-    if prior.base_ndims == 0:
-        warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
-    if init is not None:
-        # tranform: X -> U -> N
-        if callable(init):
-            @partial(wrap_random, rng_stream=rng_stream)
-            def initialiser(key, shape, dtype):
-                X = jnp.asarray(init(key, shape, dtype))
-                if X.shape != shape:
-                    raise ValueError(f"Initialiser callable for {prior.name} returned shape {np.shape(X)}, expected {shape}.")
-                if X.dtype != dtype:
-                    raise ValueError(f"Initialiser callable for {prior.name} returned dtype {X.dtype}, expected {dtype}.")
-                U = prior.inverse(X)
-                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
-                return N
-        else:
-            def initialiser(shape, dtype):
-                del shape, dtype
-                X = jnp.asarray(init)
-                U = prior.inverse(X)
-                N = quick_unit_inverse(jnp.clip(U, 1e-6, 1 - 1e-6))
-                return N
-    else:
-        if random_init:
-            initialiser = wrap_random(sample_quick_unit_dist, rng_stream)
-        else:
-            # Initialises at median of distribution using zeros.
-            initialiser = jnp.zeros
+    _validate_parameter_prior(prior)
+    base_dtype = get_base_dtype()
+    initialiser = _parameter_initialiser(prior, init, random_init, rng_stream, base_dtype)
     N_base_param = get_parameter(
         name=prior.name,
         shape=prior.base_shape,
-        dtype=prior.base_dtype,
+        dtype=base_dtype,
         init=initialiser,
         collection=param_collection
     )
-    # transform [-inf, inf] -> [0,1]
-    U_base_param = get_parameter(
-        name=prior.name,
+    _validate_array_contract(
+        N_base_param,
         shape=prior.base_shape,
-        dtype=prior.base_dtype,
-        init=quick_unit(N_base_param),
-        collection=U_collection
+        dtype=base_dtype,
+        label=f"Parameter {prior.name}"
     )
-    X_param = get_parameter(
-        name=prior.name,
-        collection=X_collection,
-        init=prior.forward(U_base_param)
+    # transform [-inf, inf] -> [0,1]
+    U_base_param = quick_unit(N_base_param)
+    _validate_array_contract(
+        U_base_param,
+        shape=prior.base_shape,
+        dtype=base_dtype,
+        label=f"Unit value {prior.name}"
     )
-    # Register the log_prob as a parameter
-    _ = get_parameter(
-        name=prior.name,
-        collection=log_prob_collection,
-        init=prior.log_prob(X_param)
-    )
+    set_state(name=prior.name, collection=U_collection, value=U_base_param)
+    X_param = prior.forward(U_base_param)
+    set_state(name=prior.name, collection=X_collection, value=X_param)
+    set_state(name=prior.name, collection=log_prob_collection, value=prior.log_prob(X_param))
     return X_param
 
 
@@ -472,22 +660,21 @@ def realise_prior(prior: AbstractPrior, U_collection: str = 'U', X_collection: s
     initaliser = wrap_random(jax.random.uniform, rng_stream)
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
+    base_dtype = get_base_dtype()
     U_base_param = get_parameter(
         name=prior.name,
         shape=prior.base_shape,
-        dtype=prior.base_dtype,
+        dtype=base_dtype,
         init=initaliser,
         collection=U_collection
     )
-    X_param = get_parameter(
-        name=prior.name,
-        collection=X_collection,
-        init=prior.forward(U_base_param)
+    _validate_array_contract(
+        U_base_param,
+        shape=prior.base_shape,
+        dtype=base_dtype,
+        label=f"Realised unit value {prior.name}"
     )
-    # Register the log_prob as a parameter
-    _ = get_parameter(
-        name=prior.name,
-        collection=log_prob_collection,
-        init=prior.log_prob(X_param)
-    )
+    X_param = prior.forward(U_base_param)
+    set_state(name=prior.name, collection=X_collection, value=X_param)
+    set_state(name=prior.name, collection=log_prob_collection, value=prior.log_prob(X_param))
     return X_param
