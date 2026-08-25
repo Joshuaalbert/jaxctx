@@ -23,8 +23,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-tests.txt
-          python -m pip install --no-deps -e .
+          python -m pip install -e ".[tests]"
+          python -m pip check
       - name: Check imports
         run: |
           python -c "import jaxctx; import jaxctx.priors.types"
@@ -33,3 +33,9 @@ jobs:
           flake8 src tests --count --select=E9,F63,F7,F82 --show-source --statistics
       - name: Run tests
         run: pytest -q
+      - name: Build and check distributions
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
