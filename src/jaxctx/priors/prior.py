@@ -1,16 +1,21 @@
 import warnings
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Tuple, Optional, Union, List, Callable, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import jax
 import numpy as np
 import tensorflow_probability.substrates.jax as tfp
 from jax import numpy as jnp
 
-from jaxctx import wrap_random, get_parameter
-from jaxctx.context import get_base_dtype, set_state
-from jaxctx.priors.types import FloatArray, IntArray, BoolArray, ComplexArray
+from jaxctx import get_parameter, wrap_random
+from jaxctx.context import (
+    _record_periodic_realisation,
+    get_base_dtype,
+    global_context,
+    set_state,
+)
+from jaxctx.priors.types import BoolArray, ComplexArray, FloatArray, IntArray
 
 tfpd = tfp.distributions
 
@@ -193,20 +198,23 @@ class AbstractPrior(ABC):
                                   log_prob_collection=log_prob_collection,
                                   rng_stream=rng_stream)
 
-    def realise(self, *, U_collection: str = 'U', X_collection: str = 'X', log_prob_collection='log_prob',
-                rng_stream: str = 'U'):
+    def realise(self, *, periodic: bool = False, U_collection: str = 'U', X_collection: str = 'X',
+                log_prob_collection='log_prob', rng_stream: str = 'U'):
         """
-        Realise the prior distribution into a parameter.
+        Realise the prior from a sampled homogeneous U-space value.
 
         Args:
+            periodic: whether every coordinate in this prior's base U shape has equivalent endpoints. Partial
+                periodicity within one prior is unsupported.
             U_collection: The collection to register the parameter in.
             X_collection: The collection to register the parameter in.
+            log_prob_collection: The collection to register the prior log probability in.
             rng_stream: The name of the random number generator stream to use for sampling U.
 
         Returns:
             A parameter representing the prior.
         """
-        return realise_prior(prior=self, U_collection=U_collection, X_collection=X_collection,
+        return realise_prior(prior=self, periodic=periodic, U_collection=U_collection, X_collection=X_collection,
                              log_prob_collection=log_prob_collection, rng_stream=rng_stream)
 
 
@@ -637,27 +645,45 @@ def prior_to_parameter(prior: AbstractPrior, init: FloatArray | Callable | None 
 
 
 def realise_prior(prior: AbstractPrior, U_collection: str = 'U', X_collection: str = 'X',
-                  log_prob_collection: str = 'log_prob', rng_stream: str = 'U'):
+                  log_prob_collection: str = 'log_prob', rng_stream: str = 'U', *, periodic: bool = False):
     """
-    Convert a prior into a non-Bayesian parameter, that takes a single value in the model, but still has an associated
-    log_prob. The parameter is registered as a `jaxns.get_parameter` with added `_param` name suffix.
-
-    To constrain the parameter we use a Normal parameter with centre on unit cube, and scale covering the whole cube,
-    as the base representation. This base representation covers the whole real line and be reliably used with SGD, etc.
+    Realise a prior from U and record its static topology during transform initialisation.
 
     Args:
         prior: any prior
         U_collection: the collection to register the parameter in for U-space.
         X_collection: the collection to register the parameter in for X-space.
+        log_prob_collection: the collection to register the prior log probability in.
         rng_stream: the name of the random number generator stream to use for sampling U.
+        periodic: whether every coordinate in the prior's base U shape has equivalent endpoints. Partial periodicity
+            within one prior is unsupported.
 
     Returns:
         A parameter representing the prior.
     """
     if prior.name is None:
         raise ValueError("Prior must have a name to be realised.")
-    # Initialises at median of distribution using zeros, else unit-normal.
-    initaliser = wrap_random(jax.random.uniform, rng_stream)
+    # Topology is a model-construction contract. Keep validation and collection
+    # out of repeated apply tracing and non-jitted apply calls.
+    if global_context.is_init:
+        if type(periodic) is not bool:
+            raise TypeError(
+                f"periodic for prior {prior.name!r} must be a Python bool, "
+                f"got {type(periodic).__name__}."
+            )
+        if periodic and not jnp.issubdtype(prior.dtype, jnp.inexact):
+            raise TypeError(
+                f"periodic=True requires a continuous prior output for {prior.name!r}, "
+                f"got dtype {prior.dtype}. Cyclic discrete variables are unsupported."
+            )
+        _record_periodic_realisation(
+            collection=U_collection,
+            name=prior.name,
+            base_shape=prior.base_shape,
+            periodic=periodic,
+        )
+    # Draw U only when the collection entry is absent; apply reuses the supplied U.
+    initializer = wrap_random(jax.random.uniform, rng_stream)
     if prior.base_ndims == 0:
         warnings.warn(f"Creating a zero-sized parameter for {prior.name}. Probably unintended.")
     base_dtype = get_base_dtype()
@@ -665,7 +691,7 @@ def realise_prior(prior: AbstractPrior, U_collection: str = 'U', X_collection: s
         name=prior.name,
         shape=prior.base_shape,
         dtype=base_dtype,
-        init=initaliser,
+        init=initializer,
         collection=U_collection
     )
     _validate_array_contract(

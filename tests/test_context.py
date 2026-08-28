@@ -1,3 +1,5 @@
+import json
+import pickle
 from dataclasses import FrozenInstanceError
 
 import jax
@@ -8,14 +10,16 @@ from jax import numpy as jnp
 from jaxctx.context import (
     ApplyReturn,
     InitReturn,
+    PeriodicEntry,
+    ScopedDict,
+    TransformMeta,
     get_parameter,
-    wrap_random,
+    scope,
     set_parameter,
     transform,
-    ScopedDict,
-    scope,
+    wrap_random,
 )
-from jaxctx.pytree import PureDataclassPytree
+from jaxctx.pytree import PureDataclassPytree, Pytree
 
 
 def test_transform():
@@ -52,8 +56,17 @@ def test_transform():
 
 def test_return_containers_preserve_fields_tuple_protocol_and_pytree_roundtrip():
     collections = {'params': ScopedDict({'x': jnp.asarray(2.)})}
+    meta = TransformMeta(periodic=(
+        PeriodicEntry(
+            collection='U',
+            scope=('model',),
+            name='phase',
+            base_shape=(),
+            periodic=True,
+        ),
+    ))
     apply_return = ApplyReturn(fn_val=jnp.asarray(1.), collections=collections)
-    init_return = InitReturn(collections=collections)
+    init_return = InitReturn(collections=collections, meta=meta)
 
     assert isinstance(apply_return, PureDataclassPytree)
     assert isinstance(init_return, PureDataclassPytree)
@@ -63,6 +76,8 @@ def test_return_containers_preserve_fields_tuple_protocol_and_pytree_roundtrip()
         apply_return.fn_val = jnp.asarray(3.)
     with pytest.raises(FrozenInstanceError):
         init_return.collections = {}
+    with pytest.raises(FrozenInstanceError):
+        init_return.meta = TransformMeta()
     assert apply_return.fn_val == 1.
     assert apply_return.collections is collections
     assert len(apply_return) == 2
@@ -73,10 +88,13 @@ def test_return_containers_preserve_fields_tuple_protocol_and_pytree_roundtrip()
     assert unpacked_apply_collections is collections
 
     assert init_return.collections is collections
-    assert len(init_return) == 1
+    assert init_return.meta is meta
+    assert len(init_return) == 2
     assert init_return[0] is collections
-    unpacked_init_collections, = init_return
+    assert init_return[1] is meta
+    unpacked_init_collections, unpacked_meta = init_return
     assert unpacked_init_collections is collections
+    assert unpacked_meta is meta
 
     apply_leaves, apply_tree = jax.tree.flatten(apply_return)
     rebuilt_apply = jax.tree.unflatten(apply_tree, apply_leaves)
@@ -94,6 +112,85 @@ def test_return_containers_preserve_fields_tuple_protocol_and_pytree_roundtrip()
         rebuilt_init.collections['params']['x'],
         init_return.collections['params']['x']
     )
+    assert rebuilt_init.meta == meta
+
+    unpickled_init = pickle.loads(pickle.dumps(init_return))
+    np.testing.assert_array_equal(
+        unpickled_init.collections['params']['x'],
+        init_return.collections['params']['x'],
+    )
+    assert unpickled_init.meta == meta
+
+
+def test_transform_meta_is_static_hashable_persistable_and_json_safe(tmp_path):
+    meta = TransformMeta(periodic=(
+        PeriodicEntry(
+            collection='U',
+            scope=(),
+            name='amplitude',
+            base_shape=(2,),
+            periodic=False,
+        ),
+        PeriodicEntry(
+            collection='U',
+            scope=('source',),
+            name='phase',
+            base_shape=(),
+            periodic=True,
+        ),
+    ))
+
+    assert isinstance(meta, Pytree)
+    assert jax.tree.leaves(meta) == []
+    assert not hasattr(meta, '__dict__')
+    assert not hasattr(meta.periodic[0], '__dict__')
+    with pytest.raises(FrozenInstanceError):
+        meta.periodic = ()
+    with pytest.raises(FrozenInstanceError):
+        meta.periodic[0].periodic = True
+    assert hash(meta) == hash(pickle.loads(pickle.dumps(meta)))
+
+    pickle_path = tmp_path / 'transform_meta.pkl'
+    meta.save(str(pickle_path))
+    assert TransformMeta.load(str(pickle_path)) == meta
+
+    wire_value = json.loads(json.dumps(meta.to_json()))
+    assert TransformMeta.from_json(wire_value) == meta
+    assert TransformMeta.from_dict(meta.to_dict()) == meta
+
+
+def test_transform_meta_rejects_invalid_or_noncanonical_records():
+    first = PeriodicEntry('U', (), 'z', (), False)
+    second = PeriodicEntry('U', (), 'a', (), True)
+
+    with pytest.raises(ValueError, match='canonical'):
+        TransformMeta(periodic=(first, second))
+    with pytest.raises(ValueError, match='unique'):
+        TransformMeta(periodic=(first, first))
+    with pytest.raises(ValueError, match='schema version'):
+        TransformMeta.from_dict({'schema_version': 2, 'periodic': []})
+    with pytest.raises(ValueError, match='schema version'):
+        TransformMeta.from_dict({'schema_version': True, 'periodic': []})
+
+
+def test_transform_meta_changes_jit_static_input_identity():
+    trace_count = 0
+
+    @jax.jit
+    def use_meta(meta):
+        nonlocal trace_count
+        trace_count += 1
+        return jnp.asarray(len(meta.periodic), dtype=jnp.int32)
+
+    empty = TransformMeta()
+    periodic = TransformMeta(periodic=(
+        PeriodicEntry('U', (), 'phase', (), True),
+    ))
+
+    assert use_meta(empty) == 0
+    assert use_meta(empty) == 0
+    assert use_meta(periodic) == 1
+    assert trace_count == 2
 
 
 def test_transformed_fn_is_slotted_and_frozen():
