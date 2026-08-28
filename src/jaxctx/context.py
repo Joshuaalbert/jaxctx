@@ -2,16 +2,30 @@ import dataclasses
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import wraps
-from typing import Any, Callable, Tuple, Optional, TypeVar, List, Dict, Generic, Union, Iterator
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import jax
 from jax import numpy as jnp
 from jax._src.typing import SupportsDType
 
+from jaxctx.metadata import PeriodicEntry, TransformMeta
 from jaxctx.priors.types import PRNGKey
 from jaxctx.pytree import PureDataclassPytree
 
 __all__ = [
+    'PeriodicEntry',
+    'TransformMeta',
     'get_parameter',
     'set_parameter',
     'transform',
@@ -243,6 +257,7 @@ class Ctx:
         self._scopes = []
         self._init = init
         self._base_dtype = base_dtype
+        self._periodic_entries: Dict[Tuple[str, Tuple[str, ...], str], PeriodicEntry] = {}
 
     def next_rng_key(self, rng_stream: str) -> PRNGKey:
         if rng_stream not in self._rngs:
@@ -271,6 +286,35 @@ class Ctx:
 
     def get_collection(self, collection: str) -> ScopedDict:
         return self._collections[collection].with_scopes(self._scopes)
+
+    @property
+    def transform_meta(self) -> TransformMeta:
+        entries = tuple(sorted(
+            self._periodic_entries.values(),
+            key=lambda entry: (entry.collection, entry.scope, entry.name),
+        ))
+        return TransformMeta(periodic=entries)
+
+    def record_periodic(self, *, collection: str, name: str, base_shape: Tuple[int, ...], periodic: bool):
+        if not self._init:
+            return
+        entry = PeriodicEntry(
+            collection=collection,
+            scope=tuple(self._scopes),
+            name=name,
+            base_shape=tuple(int(size) for size in base_shape),
+            periodic=periodic,
+        )
+        key = (entry.collection, entry.scope, entry.name)
+        previous = self._periodic_entries.get(key)
+        if previous is not None and previous != entry:
+            qualified_name = '.'.join(entry.scope + (entry.name,))
+            raise ValueError(
+                f"Conflicting periodic declarations for {entry.collection}[{qualified_name!r}]: "
+                f"first base_shape={previous.base_shape}, periodic={previous.periodic}; "
+                f"second base_shape={entry.base_shape}, periodic={entry.periodic}."
+            )
+        self._periodic_entries[key] = entry
 
     def push_scope(self, scope):
         self._scopes.append(scope)
@@ -310,6 +354,22 @@ class GlobalContext:
         if len(self.stack) == 0:
             raise ValueError("No context available. Must use `transform` to create a context.")
         return self.stack[-1].get_collection(collection)
+
+    @property
+    def transform_meta(self) -> TransformMeta:
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use `transform` to create a context.")
+        return self.stack[-1].transform_meta
+
+    def record_periodic(self, *, collection: str, name: str, base_shape: Tuple[int, ...], periodic: bool):
+        if len(self.stack) == 0:
+            raise ValueError("No context available. Must use `transform` to create a context.")
+        self.stack[-1].record_periodic(
+            collection=collection,
+            name=name,
+            base_shape=base_shape,
+            periodic=periodic,
+        )
 
     def next_rng_key(self, rng_stream: str) -> PRNGKey:
         if len(self.stack) == 0:
@@ -521,16 +581,19 @@ class ApplyReturn(PureDataclassPytree, Generic[FV]):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class InitReturn(PureDataclassPytree, Generic[FV]):
+    """Numerical collections and init-only static transform metadata."""
+
     collections: Dict[str, ScopedDict]
+    meta: TransformMeta = TransformMeta()
 
     def __iter__(self):
-        return iter((self.collections,))
+        return iter((self.collections, self.meta))
 
     def __len__(self):
-        return 1
+        return 2
 
     def __getitem__(self, item):
-        return (self.collections,)[item]
+        return (self.collections, self.meta)[item]
 
 
 ApplyReturn.register_pytree()
@@ -554,7 +617,7 @@ class TransformedFn(Generic[FV]):
             **kwargs: kwargs to function
 
         Returns:
-            The output of the function at the given input and the states
+            The function value and updated numerical collections.
         """
         return self._apply_fn(rngs, collections, *args, **kwargs)
 
@@ -569,7 +632,7 @@ class TransformedFn(Generic[FV]):
             **kwargs: kwargs to function
 
         Returns:
-            The output of the function at the given input and the states
+            Initialised numerical collections and static transform metadata.
         """
         return self._init_fn(rngs, collections, *args, **kwargs)
 
@@ -598,7 +661,7 @@ def transform(f: Callable[..., FV], *, base_dtype=jnp.float32) -> TransformedFn[
             **kwargs: kwargs to function
 
         Returns:
-            The output of the function at the given input and the states
+            The function value and updated numerical collections.
         """
         if collections is None:
             collections = {}
@@ -616,7 +679,7 @@ def transform(f: Callable[..., FV], *, base_dtype=jnp.float32) -> TransformedFn[
             **kwargs: kwargs to function
 
         Returns:
-            The output of the function at the given input and the states
+            Initialised numerical collections and static transform metadata.
         """
         if collections is None:
             collections = {}
@@ -625,7 +688,10 @@ def transform(f: Callable[..., FV], *, base_dtype=jnp.float32) -> TransformedFn[
             # can be sped up with aeval
             _ = f(*args, **kwargs)
             del _  # Ensure no closure issues
-            return InitReturn(collections=global_context.collections)
+            return InitReturn(
+                collections=global_context.collections,
+                meta=global_context.transform_meta,
+            )
 
     return TransformedFn(_init_fn=init_fn, _apply_fn=apply_fn, base_dtype=base_dtype)
 
@@ -643,3 +709,13 @@ def next_rng_key(rng_stream: str):
 def get_base_dtype():
     """Return the shared N-space and U-space dtype for the active transformed model."""
     return global_context.base_dtype
+
+
+def _record_periodic_realisation(*, collection: str, name: str, base_shape: Tuple[int, ...], periodic: bool):
+    """Record init-only prior topology without exposing it as numerical collection state."""
+    global_context.record_periodic(
+        collection=collection,
+        name=name,
+        base_shape=base_shape,
+        periodic=periodic,
+    )

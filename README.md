@@ -13,6 +13,7 @@ uses one base dtype and applies the real-to-unit transform once to the complete 
 the individual priors.
 
 ```python
+import jax
 import jax.numpy as jnp
 import tensorflow_probability.substrates.jax as tfp
 
@@ -60,7 +61,50 @@ location, weights = parameters.parameter(
 )
 ```
 
+## Periodic prior topology
+
+A realised continuous prior can declare that every coordinate in its homogeneous base-space shape has equivalent
+endpoints:
+
+```python
+import jax
+import tensorflow_probability.substrates.jax as tfp
+
+from jaxctx import transform
+from jaxctx.priors import Prior
+
+tfpd = tfp.distributions
+phase = Prior(tfpd.Uniform(0., 1.), name="phase")
+
+
+def model():
+    return phase.realise(periodic=True)
+
+
+collections, meta = transform(model).init(
+    {"U": jax.random.PRNGKey(0)},
+    {},
+)
+```
+
+`meta.periodic` contains immutable `PeriodicEntry` records aligned by U collection, scope, prior name, and base shape.
+The declaration is static topology metadata: it does not wrap U, change the prior measure, or alter X and log-probability
+calculations. Canonical U values remain in `[0, 1)`.
+
+`TransformMeta` is a zero-leaf static `Pytree`. Use its inherited `save`/`load` helpers for pickle persistence, or
+`to_json`/`from_json` for the versioned JSON-safe representation.
+
+`periodic=True` applies to the complete `base_shape` of one realised prior. Represent mixed periodic and non-periodic
+variables as separate priors; partial periodicity within one prior and cyclic categorical variables are unsupported.
+Changing topology requires constructing a new transformed model or explicitly retracing a static declaration.
+
+The `InitReturn` tuple protocol has two values as of 1.2.0: `collections, meta`. Named access through
+`result.collections` and `result.meta` is also supported. `ApplyReturn` is unchanged and does not carry metadata.
+
 # Change Log
+
+28 Aug, 2026 -- 1.2.0 adds init-only periodic base-space topology metadata for realised priors. `InitReturn` now unpacks
+as `(collections, meta)`; `ApplyReturn` is unchanged.
 
 25 Feb, 2026 -- 1.1.0 released with scoped dicts structure changes. Breaks backward compatibility with 1.0.x, but adds
 support for nested contexts and more flexible scoping.
